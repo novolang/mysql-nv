@@ -1,0 +1,536 @@
+// mypacket.nv — the frame, the sequence number, and the capabilities
+// that decide what the bytes mean.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// THE CAPABILITIES ARE A PARAMETER TO THE PARSER, AND THAT IS THE ONE
+// THING THAT MAKES THIS PROTOCOL DIFFERENT FROM POSTGRESQL'S.  In
+// PostgreSQL a message's type byte determines its shape for all time.
+// In MySQL the SAME BYTES are two different messages depending on what
+// the handshake agreed: with `CLIENT_DEPRECATE_EOF` the server sends an
+// OK packet where it used to send an EOF, with `CLIENT_PROTOCOL_41` the
+// error packet carries a SQLSTATE and without it does not, and the
+// result-set terminator moves.  So every decode here takes a
+// `MyCapabilities`, and a decoder that cached the wrong one produces
+// plausible garbage rather than an error.
+//
+// THE SEQUENCE NUMBER IS THE CLIENT'S TO KEEP.  Every packet carries a
+// one-byte sequence id that resets to 0 at the start of each command
+// and increments per packet, wrapping at 256.  The server checks it and
+// answers `Packets out of order` — which is not a network problem and
+// is not a query problem, and is the single commonest symptom of a
+// hand-written MySQL client.  `MySeq` is a value the caller threads, so
+// the counter belongs to the connection and not to a global.
+//
+// A 16 MB PAYLOAD IS SPLIT AND THE LAST PIECE MAY BE EMPTY.  The length
+// field is three bytes, so a payload of exactly `0xFFFFFF` is CONTINUED
+// by another packet — and a payload that is an exact multiple of
+// `0xFFFFFF` is followed by a final packet of length ZERO to say it
+// ended.  A reader that took the length at face value truncates a large
+// row; one that stopped at the first short packet hangs on the
+// zero-length terminator.  `is_continued` is that rule.
+//
+// `0xFE` IS THREE DIFFERENT THINGS.  It begins an EOF packet, it is the
+// prefix of an 8-byte length-encoded integer, and it is a legal first
+// byte of row data.  Which one it is depends on the packet's LENGTH and
+// on the capabilities — an EOF packet is at most 9 bytes — and a parser
+// that branched on the byte alone misreads any row beginning with it.
+// `looks_like_eof` carries the whole rule.
+//
+// NOTHING HERE PERFORMS ANYTHING.  Every row in this module is `[]`.
+
+// What the two ends agreed in the handshake.
+//
+// A value, threaded through every decode, because the wire format
+// depends on it.  Held as the server's 32-bit flag word rather than a
+// struct of booleans: the set is the server's, it grows, and a client
+// that modelled only the flags it knew could not echo the rest back.
+pub struct MyCapabilities
+    flags: Int
+
+// A packet's sequence number.
+//
+// Wraps at 256, resets at the start of each command.  A value so that
+// two connections cannot share one counter — which is what a global
+// would give them, and what produces `Packets out of order` on the
+// connection that did nothing wrong.
+pub struct MySeq
+    n: Int
+
+// One packet off the wire.
+//
+// `payload` is a range into the caller's buffer rather than a copy: a
+// result set is thousands of packets and a reader that copied each one
+// allocates the whole answer twice.
+pub struct MyPacket
+    seq: Int
+    payload_at: Int
+    payload_len: Int
+
+// What a packet turned out to be.
+//
+// The first byte plus the capabilities plus the length decide, and the
+// three together are why this is a function rather than a match on a
+// byte.
+pub enum MyPacketKind
+    // `0x00`, and at least 7 bytes: rows affected, last insert id,
+    // status flags, warnings.
+    MyOkPacket
+    // `0xFF`: an error code, a SQLSTATE when the capabilities include
+    // it, and a message.
+    MyErrPacket
+    // `0xFE` and at most 9 bytes: the old result-set terminator.  With
+    // `CLIENT_DEPRECATE_EOF` the server sends an OK packet here
+    // instead, and this kind never appears.
+    MyEofPacket
+    // `0xFB`: the server is asking the client to send a local file.
+    // The one packet a client may refuse, and the README says why.
+    MyLocalInfileRequest
+    // `0x01`: more authentication data follows.
+    MyAuthMoreData
+    // Anything else: a row, a column definition, a handshake, a
+    // statement response — decided by where the exchange is rather than
+    // by the byte.
+    MyPayload
+
+// Why bytes were not a packet.
+pub enum MyPacketFault
+    // Fewer than four bytes: not a header yet.  Not an error at the
+    // socket level, which is why `frame_length` answers an optional and
+    // this variant is for a caller that asked for a decode.
+    MyIncompletePacket(have: Int, want: Int)
+    // The declared payload is past the caller's ceiling.  Three bytes
+    // an attacker controls, so the bound is the caller's and a length
+    // past it is a refusal rather than an allocation.
+    MyPacketTooLarge(declared: Int, limit: Int)
+    // The sequence number is not the one expected.  The server's own
+    // `Packets out of order`, caught on the client side where it can
+    // still say what was expected.
+    MyOutOfOrder(expected: Int, found: Int)
+    // A packet whose payload is shorter than the kind it claims to be.
+    MyShortPayload(kind: Str, have: Int, want: Int)
+    // A length-encoded integer whose prefix is one the format does not
+    // define.
+    MyBadLengthEncoding(at: Int, prefix: Int)
+
+// The standard `Error` implementation.
+impl Error for MyPacketFault
+    // One line: what was wrong, and where in the packet.
+    fn message(self) -> Str
+        todo("mysql-nv.mypacket.MyPacketFault.message")
+
+// No capabilities at all: what a client has before the handshake.
+//
+// ```novo
+// use mypacket
+//
+// fn main() [io]
+//     println("${mypacket.no_capabilities().flags}")
+// ```
+pub fn no_capabilities() -> MyCapabilities []
+    todo("mysql-nv.mypacket.no_capabilities")
+
+// The capabilities a modern client asks for.
+//
+// Protocol 4.1, the deprecated EOF, SSL when the caller wants it,
+// prepared statements, multi-results, and the plugin authentication
+// every server built this decade requires.  Published as a starting
+// value so a caller adds or removes one flag rather than assembling
+// thirty-two.
+//
+// ```novo
+// use mypacket
+//
+// fn main() [io]
+//     println("${mypacket.default_capabilities().flags}")
+// ```
+pub fn default_capabilities() -> MyCapabilities []
+    todo("mysql-nv.mypacket.default_capabilities")
+
+// Is this flag set?
+//
+// ```novo
+// use mypacket
+//
+// fn deprecated_eof(c: MyCapabilities) -> Bool
+//     mypacket.has_capability(c, mypacket.capability_deprecate_eof())
+//
+// fn main() [io]
+//     println("whether the server still sends EOF packets")
+// ```
+pub fn has_capability(c: MyCapabilities, flag: Int) -> Bool []
+    todo("mysql-nv.mypacket.has_capability")
+
+// The capabilities both ends have: the intersection.
+//
+// What the client asked for AND what the server offered, which is what
+// every later decode must use.  A client that kept its own request
+// instead parses the server's answers with flags the server never
+// agreed to.
+//
+// ```novo
+// use mypacket
+//
+// fn agreed(want: MyCapabilities, offered: MyCapabilities) -> MyCapabilities
+//     mypacket.negotiate(want, offered)
+//
+// fn main() [io]
+//     println("what both ends actually speak")
+// ```
+pub fn negotiate(want: MyCapabilities, offered: MyCapabilities) -> MyCapabilities []
+    todo("mysql-nv.mypacket.negotiate")
+
+// `CLIENT_PROTOCOL_41`, the flag that puts a SQLSTATE on an error.
+//
+// ```novo
+// use mypacket
+//
+// fn main() [io]
+//     println("${mypacket.capability_protocol_41()}")
+// ```
+pub fn capability_protocol_41() -> Int []
+    todo("mysql-nv.mypacket.capability_protocol_41")
+
+// `CLIENT_DEPRECATE_EOF`, the flag that replaces EOF packets with OK
+// ones.
+//
+// ```novo
+// use mypacket
+//
+// fn main() [io]
+//     println("${mypacket.capability_deprecate_eof()}")
+// ```
+pub fn capability_deprecate_eof() -> Int []
+    todo("mysql-nv.mypacket.capability_deprecate_eof")
+
+// `CLIENT_SSL`, the flag that says the next bytes are a TLS handshake.
+//
+// ```novo
+// use mypacket
+//
+// fn main() [io]
+//     println("${mypacket.capability_ssl()}")
+// ```
+pub fn capability_ssl() -> Int []
+    todo("mysql-nv.mypacket.capability_ssl")
+
+// `CLIENT_LOCAL_FILES`, the flag that lets the server ask for a file.
+//
+// A client that does not set it cannot be asked, which is the only
+// complete defence — see the README.
+//
+// ```novo
+// use mypacket
+//
+// fn main() [io]
+//     println("${mypacket.capability_local_files()}")
+// ```
+pub fn capability_local_files() -> Int []
+    todo("mysql-nv.mypacket.capability_local_files")
+
+// `CLIENT_PLUGIN_AUTH`, without which no server built this decade will
+// let a client in.
+//
+// ```novo
+// use mypacket
+//
+// fn main() [io]
+//     println("${mypacket.capability_plugin_auth()}")
+// ```
+pub fn capability_plugin_auth() -> Int []
+    todo("mysql-nv.mypacket.capability_plugin_auth")
+
+// How long the packet starting here is, or `None` when the header is
+// not all there.
+//
+// A socket read returns whatever the kernel had, which is a packet and
+// a half about as often as it is a packet.  `max_bytes` is the caller's
+// ceiling on the three-byte length field, which an attacker controls.
+//
+// ```novo
+// use mypacket
+//
+// fn how_long(buf: Bytes) -> Result<?Int, MyPacketFault>
+//     mypacket.frame_length(buf, 0, 16777216)
+//
+// fn main() [io]
+//     println("how many bytes the next packet needs")
+// ```
+pub fn frame_length(buf: Bytes, at: Int, max_bytes: Int) -> Result<?Int, MyPacketFault> []
+    todo("mysql-nv.mypacket.frame_length")
+
+// Read one packet, checking its sequence number.
+//
+// The check is here rather than left to a caller because the server
+// answers `Packets out of order` and closes, and the client is the only
+// party that still knows what it expected.
+//
+// ```novo
+// use mypacket
+//
+// fn one(buf: Bytes, s: MySeq) -> Result<?MyPacket, MyPacketFault>
+//     mypacket.read_packet(buf, 0, s, 16777216)
+//
+// fn main() [io]
+//     println("the next packet, if it is all here")
+// ```
+pub fn read_packet(buf: Bytes, at: Int, expected: MySeq,
+                   max_bytes: Int) -> Result<?MyPacket, MyPacketFault> []
+    todo("mysql-nv.mypacket.read_packet")
+
+// Is this packet continued by the next one?
+//
+// A payload of exactly `0xFFFFFF` is split, and a payload that is an
+// exact multiple of it is followed by a packet of length ZERO.  A
+// reader that stopped at the first short packet hangs on that
+// terminator; one that took the length at face value truncates the row.
+//
+// ```novo
+// use mypacket
+//
+// fn more(p: MyPacket) -> Bool
+//     mypacket.is_continued(p)
+//
+// fn main() [io]
+//     println("whether a large row goes on")
+// ```
+pub fn is_continued(p: MyPacket) -> Bool []
+    todo("mysql-nv.mypacket.is_continued")
+
+// The largest payload one packet may carry: `0xFFFFFF`.
+//
+// ```novo
+// use mypacket
+//
+// fn main() [io]
+//     println("${mypacket.max_payload_bytes()}")
+// ```
+pub fn max_payload_bytes() -> Int []
+    todo("mysql-nv.mypacket.max_payload_bytes")
+
+// What kind of packet this is, given what the handshake agreed.
+//
+// The capabilities are an argument because the same bytes are different
+// messages under different flags — which is the whole reason this
+// package threads them everywhere.
+//
+// ```novo
+// use mypacket
+//
+// fn what(buf: Bytes, p: MyPacket, c: MyCapabilities) -> MyPacketKind
+//     mypacket.kind_of(buf, p, c)
+//
+// fn main() [io]
+//     println("what a packet turned out to be")
+// ```
+pub fn kind_of(buf: Bytes, p: MyPacket, c: MyCapabilities) -> MyPacketKind []
+    todo("mysql-nv.mypacket.kind_of")
+
+// Is this the old result-set terminator?
+//
+// `0xFE` is three different things: the start of an EOF packet, the
+// prefix of an 8-byte length-encoded integer, and a legal first byte of
+// row data.  An EOF packet is at most 9 bytes long and only exists
+// without `CLIENT_DEPRECATE_EOF`, so the length and the capabilities
+// are both part of the answer.  A parser that branched on the byte
+// alone misreads any row that begins with it.
+//
+// ```novo
+// use mypacket
+//
+// fn ends(buf: Bytes, p: MyPacket, c: MyCapabilities) -> Bool
+//     mypacket.looks_like_eof(buf, p, c)
+//
+// fn main() [io]
+//     println("whether a result set just ended")
+// ```
+pub fn looks_like_eof(buf: Bytes, p: MyPacket, c: MyCapabilities) -> Bool []
+    todo("mysql-nv.mypacket.looks_like_eof")
+
+// An OK packet's contents.
+pub struct MyOk
+    affected_rows: Int
+    last_insert_id: Int
+    // The server's status flags: in a transaction, autocommit, more
+    // results waiting.  Carried because "are we inside a transaction"
+    // has no other carrier in this protocol — there is no
+    // `ReadyForQuery` here.
+    status_flags: Int
+    warnings: Int
+    // The human-readable trailer, as a range.
+    info_at: Int
+    info_len: Int
+
+// Read an OK packet.
+//
+// ```novo
+// use mypacket
+//
+// fn ok(buf: Bytes, p: MyPacket, c: MyCapabilities) -> Result<MyOk, MyPacketFault>
+//     mypacket.read_ok(buf, p, c)
+//
+// fn main() [io]
+//     println("what a statement did")
+// ```
+pub fn read_ok(buf: Bytes, p: MyPacket, c: MyCapabilities) -> Result<MyOk, MyPacketFault> []
+    todo("mysql-nv.mypacket.read_ok")
+
+// Is the connection inside a transaction, per an OK packet's status
+// flags?
+//
+// The question PostgreSQL answers with `ReadyForQuery` and MySQL
+// answers nowhere else.  A caller that acted without asking acted
+// inside a transaction the server may have rolled back under it.
+//
+// ```novo
+// use mypacket
+//
+// fn open(o: MyOk) -> Bool
+//     mypacket.in_transaction(o)
+//
+// fn main() [io]
+//     println("whether a transaction is open")
+// ```
+pub fn in_transaction(o: MyOk) -> Bool []
+    todo("mysql-nv.mypacket.in_transaction")
+
+// Is another result set waiting behind this one?
+//
+// `SERVER_MORE_RESULTS_EXISTS`.  A client that ignored it leaves
+// unread packets on the socket, and the NEXT query reads the previous
+// statement's rows — which is the failure that looks like data
+// corruption and is a framing bug.
+//
+// ```novo
+// use mypacket
+//
+// fn again(o: MyOk) -> Bool
+//     mypacket.more_results(o)
+//
+// fn main() [io]
+//     println("whether another result set follows")
+// ```
+pub fn more_results(o: MyOk) -> Bool []
+    todo("mysql-nv.mypacket.more_results")
+
+// A length-encoded integer, and how many bytes it took.
+//
+// MySQL's own varint: one byte below 251, then `0xFC` plus two, `0xFD`
+// plus three, `0xFE` plus eight.  `0xFB` is not a number at all — it is
+// NULL in a text-protocol row, which is why the decoder answers `None`
+// for it rather than zero.
+//
+// ```novo
+// use mypacket
+//
+// fn number(buf: Bytes) -> Bool
+//     match mypacket.read_length_encoded(buf, 0)
+//         Some(hit) => true
+//         None      => false
+//
+// fn main() [io]
+//     println("a length-encoded integer")
+// ```
+pub fn read_length_encoded(buf: Bytes, at: Int) -> ?MyLengthEncoded []
+    todo("mysql-nv.mypacket.read_length_encoded")
+
+// One length-encoded integer, and where it ended.
+pub struct MyLengthEncoded
+    value: Int
+    next_at: Int
+    // The prefix was `0xFB`: NULL in a text row, and not a number.
+    // Carried rather than answered as zero, because a NULL and a zero
+    // are two different values and collapsing them is the classic
+    // driver bug.
+    is_null: Bool
+
+// A length-encoded integer, written.
+//
+// ```novo
+// use mypacket
+//
+// fn bytes_of(n: Int) -> Bytes
+//     mypacket.write_length_encoded(n)
+//
+// fn main() [io]
+//     println("a number, as the wire writes it")
+// ```
+pub fn write_length_encoded(n: Int) -> Bytes []
+    todo("mysql-nv.mypacket.write_length_encoded")
+
+// A length-encoded string: the length, then that many bytes.
+//
+// ```novo
+// use mypacket
+//
+// fn text(buf: Bytes) -> Bool
+//     match mypacket.read_length_encoded_string(buf, 0)
+//         Some(hit) => true
+//         None      => false
+//
+// fn main() [io]
+//     println("a string, as the wire writes it")
+// ```
+pub fn read_length_encoded_string(buf: Bytes, at: Int) -> ?MyLengthEncodedString []
+    todo("mysql-nv.mypacket.read_length_encoded_string")
+
+// One length-encoded string: a range into the caller's buffer, and
+// where it ended.
+pub struct MyLengthEncodedString
+    at: Int
+    len: Int
+    next_at: Int
+    is_null: Bool
+
+// A packet's bytes, header included, ready to write.
+//
+// Splits a payload past `0xFFFFFF` into as many packets as it takes,
+// with the zero-length terminator where the format requires one, and
+// advances the sequence number across all of them.
+//
+// ```novo
+// use mypacket
+//
+// fn wire(payload: Bytes, s: MySeq) -> MyWritten
+//     mypacket.write_packet(payload, s)
+//
+// fn main() [io]
+//     println("a command, framed")
+// ```
+pub fn write_packet(payload: Bytes, s: MySeq) -> MyWritten []
+    todo("mysql-nv.mypacket.write_packet")
+
+// The bytes to send, and the sequence number to continue from.
+pub struct MyWritten
+    bytes: Bytes
+    seq: MySeq
+
+// The sequence number a command starts at: zero.
+//
+// A function rather than a literal, because "reset at the start of each
+// command" is the rule and a caller that wrote `0` in one place and
+// forgot it in another gets `Packets out of order` on the second
+// statement.
+//
+// ```novo
+// use mypacket
+//
+// fn main() [io]
+//     println("${mypacket.command_seq().n}")
+// ```
+pub fn command_seq() -> MySeq []
+    todo("mysql-nv.mypacket.command_seq")
+
+// The next sequence number, wrapping at 256.
+//
+// ```novo
+// use mypacket
+//
+// fn after(s: MySeq) -> MySeq
+//     mypacket.next_seq(s)
+//
+// fn main() [io]
+//     println("the sequence number the next packet carries")
+// ```
+pub fn next_seq(s: MySeq) -> MySeq []
+    todo("mysql-nv.mypacket.next_seq")

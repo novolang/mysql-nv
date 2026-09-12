@@ -1,0 +1,384 @@
+// mytype.nv — a column, and the two different ways its value arrives.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// THE SAME COLUMN IS TWO DIFFERENT ENCODINGS AND THE STATEMENT DECIDES
+// WHICH.  A text-protocol row sends every value as a length-encoded
+// STRING — an integer is the characters `4` `2` — and a binary-protocol
+// row (what a prepared statement returns) sends it in the column type's
+// own layout, little-endian, with a NULL BITMAP at the front.  A
+// decoder that used one for the other reads a four-byte integer as a
+// four-character string, which is not an error and is not the value.
+// `MyRowFormat` is the parameter that decides, and it is required at
+// every row decode rather than remembered.
+//
+// A NULL IS NOT AN EMPTY STRING, AND THE TWO FORMATS SAY SO
+// DIFFERENTLY.  In a text row, NULL is the length prefix `0xFB` and an
+// empty string is a length of zero; in a binary row, NULL is a bit in
+// the bitmap and the value is ABSENT from the payload entirely — so a
+// binary decoder that did not read the bitmap first reads every
+// subsequent column at the wrong offset.  `MyNull` is a variant of
+// `MyValue`, never an empty buffer.
+//
+// `DECIMAL` IS TEXT IN BOTH PROTOCOLS AND MUST STAY TEXT.  The server
+// sends it as characters, and a driver that parsed it into a `Float`
+// has rounded somebody's money.  `MyDecimal` carries the digits.
+//
+// A DATE CAN BE ZERO, AND `0000-00-00` IS A VALUE MySQL STORES.  It is
+// not a date, no calendar has it, and a driver that refused it cannot
+// read tables that exist.  It is its own variant.
+//
+// THE `flags` ON A COLUMN CHANGE WHAT THE TYPE MEANS.  `UNSIGNED_FLAG`
+// turns a `BIGINT` into a range no signed 64-bit integer holds;
+// `BINARY_FLAG` turns a `VARCHAR` into a `VARBINARY` that is bytes and
+// not text.  A decoder that looked only at the type code answers a
+// negative number for a large unsigned value and mangles binary data as
+// UTF-8.
+//
+// NOTHING HERE PERFORMS ANYTHING.  Every row in this module is `[]`.
+
+use civil
+
+// One column, as the server described it.
+//
+// The names are ranges into the caller's bytes: a wide result set
+// carries a column definition packet per column, and a reader that made
+// a `Str` of every name allocates the schema on every query.
+pub struct MyColumn
+    catalog_at: Int
+    catalog_len: Int
+    schema_at: Int
+    schema_len: Int
+    table_at: Int
+    table_len: Int
+    name_at: Int
+    name_len: Int
+    // The collation, which is what decides whether a string column's
+    // bytes are text or binary: collation 63 is `binary`.
+    character_set: Int
+    column_length: Int
+    type_code: Int
+    // `UNSIGNED_FLAG`, `BINARY_FLAG`, `NOT_NULL_FLAG` and the rest.
+    // Part of the type, not metadata: see the module header.
+    flags: Int
+    decimals: Int
+
+// Which encoding a row is in.
+//
+// Required at every row decode rather than remembered, because the same
+// connection runs both: a `SELECT` sent as text and the same `SELECT`
+// prepared come back differently.
+pub enum MyRowFormat
+    // Every value a length-encoded string; NULL is the prefix `0xFB`.
+    MyTextRow
+    // The column type's own little-endian layout, behind a NULL bitmap.
+    MyBinaryRow
+
+// One value out of a row.
+//
+// The variants a caller branches on.  `MyUnknown` carries the type code
+// and the bytes rather than guessing, so an extension type or a version
+// this package predates reaches a caller who knows what to do with it.
+pub enum MyValue
+    // The absence of a value, which is not an empty string and not a
+    // zero.
+    MyNull
+    MyInt(v: Int)
+    // A `BIGINT UNSIGNED` past what a signed 64-bit integer holds.  Its
+    // digits, because there is no other lossless carrier.
+    MyUnsignedText(digits: Str)
+    MyFloat(v: Float)
+    // `DECIMAL` and `NUMERIC`: the digits as the server sent them.  A
+    // driver that made this a `Float` has rounded somebody's money.
+    MyDecimal(digits: Str)
+    MyText(v: Str)
+    // A `VARBINARY`, a `BLOB`, or a `VARCHAR` with the binary
+    // collation.  Bytes, and not text that happens to be valid.
+    MyBytes(v: Bytes)
+    MyDate(year: Int, month: Int, day: Int)
+    MyDateTime(year: Int, month: Int, day: Int, hour: Int, minute: Int, second: Int,
+               microsecond: Int)
+    // `TIME` is a DURATION and can be negative and can exceed 24 hours:
+    // `-838:59:59` to `838:59:59`.  A driver that modelled it as a
+    // clock time cannot hold half its range.
+    MyTime(negative: Bool, days: Int, hour: Int, minute: Int, second: Int, microsecond: Int)
+    // `0000-00-00` and `0000-00-00 00:00:00`: values MySQL stores and
+    // no calendar has.  A driver that refused them cannot read tables
+    // that exist.
+    MyZeroDate
+    MyBit(bits: Bytes)
+    // `JSON`: the document as the text it arrived as, for `std.json` to
+    // parse.
+    MyJson(text: Str)
+    // A type this package does not model.  The code, and the bytes.
+    MyUnknown(type_code: Int, raw: Bytes)
+
+// Why a value did not decode.
+pub enum MyTypeFault
+    // The payload ended inside a value.
+    MyValueTruncated(column: Int, at: Int)
+    // A binary-row value whose declared width is not the type's.
+    MyBadBinaryWidth(column: Int, type_code: Int, found: Int)
+    // A text-row value that is not the number it should be.
+    MyBadNumericText(column: Int, text: Str)
+    // The NULL bitmap is shorter than the column count.  Reported
+    // rather than read past, because reading past it puts every
+    // subsequent column at the wrong offset and the answer looks like
+    // data.
+    MyShortNullBitmap(columns: Int, have: Int)
+
+// The standard `Error` implementation.
+impl Error for MyTypeFault
+    // One line: which column, and what was wrong with it.
+    fn message(self) -> Str
+        todo("mysql-nv.mytype.MyTypeFault.message")
+
+// Read a column definition packet.
+//
+// ```novo
+// use mytype
+// use mypacket
+//
+// fn column(buf: Bytes, p: MyPacket, c: MyCapabilities) -> Result<MyColumn, MyTypeFault>
+//     mytype.read_column(buf, p, c)
+//
+// fn main() [io]
+//     println("one column of a result set")
+// ```
+pub fn read_column(buf: Bytes, p: MyPacket, c: MyCapabilities) -> Result<MyColumn, MyTypeFault> []
+    todo("mysql-nv.mytype.read_column")
+
+// The column's name, as a string.
+//
+// The one place a range becomes a `Str`, so a caller that wants three
+// names out of forty pays for three.
+//
+// ```novo
+// use mytype
+//
+// fn named(col: MyColumn, buf: Bytes) -> Str
+//     mytype.column_name(col, buf)
+//
+// fn main() [io]
+//     println("one column name")
+// ```
+pub fn column_name(col: MyColumn, buf: Bytes) -> Str []
+    todo("mysql-nv.mytype.column_name")
+
+// Read one row.
+//
+// The format is an argument, not a memory: the same connection runs
+// both, and a decoder that used the wrong one reads a four-byte integer
+// as a four-character string — which is not an error and is not the
+// value.
+//
+// ```novo
+// use mytype
+//
+// fn row(buf: Bytes, cols: [MyColumn], at: Int) -> Result<[MyValue], MyTypeFault>
+//     mytype.read_row(buf, at, cols, MyTextRow)
+//
+// fn main() [io]
+//     println("one row of a result set")
+// ```
+pub fn read_row(buf: Bytes, at: Int, columns: [MyColumn],
+                format: MyRowFormat) -> Result<[MyValue], MyTypeFault> []
+    todo("mysql-nv.mytype.read_row")
+
+// Is this column NULL in a binary row's bitmap?
+//
+// Published because the bitmap has a TWO-BIT OFFSET in a result row —
+// the first two bits are reserved — and none in a statement's parameter
+// bitmap.  A decoder that used the same indexing for both reads every
+// value of a prepared statement's answer shifted by one column.
+//
+// ```novo
+// use mytype
+//
+// fn absent(bitmap: Bytes) -> Bool
+//     mytype.binary_null_at(bitmap, 0, true)
+//
+// fn main() [io]
+//     println("whether a binary row's column is NULL")
+// ```
+pub fn binary_null_at(bitmap: Bytes, column: Int, is_result_row: Bool) -> Bool []
+    todo("mysql-nv.mytype.binary_null_at")
+
+// How many bytes a NULL bitmap takes for this many columns.
+//
+// ```novo
+// use mytype
+//
+// fn main() [io]
+//     println("${mytype.null_bitmap_bytes(9, true)}")
+// ```
+pub fn null_bitmap_bytes(columns: Int, is_result_row: Bool) -> Int []
+    todo("mysql-nv.mytype.null_bitmap_bytes")
+
+// Does this column's flags make it unsigned?
+//
+// `UNSIGNED_FLAG`, and it changes the type: a `BIGINT UNSIGNED` holds
+// values no signed 64-bit integer does, which is why `MyUnsignedText`
+// exists rather than a negative number.
+//
+// ```novo
+// use mytype
+//
+// fn main() [io]
+//     println("whether a column is unsigned")
+// ```
+pub fn is_unsigned(col: MyColumn) -> Bool []
+    todo("mysql-nv.mytype.is_unsigned")
+
+// Is this column bytes rather than text?
+//
+// `BINARY_FLAG`, or the `binary` collation (63).  A decoder that looked
+// only at the type code mangles a `VARBINARY` as UTF-8.
+//
+// ```novo
+// use mytype
+//
+// fn main() [io]
+//     println("whether a column is bytes")
+// ```
+pub fn is_binary(col: MyColumn) -> Bool []
+    todo("mysql-nv.mytype.is_binary")
+
+// The name of a type code, as `SHOW COLUMNS` would print it.
+//
+// For a message, for a schema dump, and so a caller meeting
+// `MyUnknown(246, ...)` can find out that 246 is `DECIMAL`.
+//
+// ```novo
+// use mytype
+//
+// fn main() [io]
+//     println(mytype.type_name(3))
+// ```
+pub fn type_name(type_code: Int) -> Str []
+    todo("mysql-nv.mytype.type_name")
+
+// Encode a parameter for a prepared statement.
+//
+// Answers the type code the statement must declare alongside the bytes,
+// because the binary protocol sends the types in one block and the
+// values in another and a caller assembling them separately gets them
+// out of step.
+//
+// ```novo
+// use mytype
+//
+// fn bound(v: MyValue) -> MyBoundParameter
+//     mytype.encode_parameter(v)
+//
+// fn main() [io]
+//     println("a value, bound to a statement")
+// ```
+pub fn encode_parameter(v: MyValue) -> MyBoundParameter []
+    todo("mysql-nv.mytype.encode_parameter")
+
+// One bound parameter: its declared type and its bytes.
+pub struct MyBoundParameter
+    type_code: Int
+    unsigned: Bool
+    bytes: Bytes
+    // NULL travels in the bitmap and not in the payload, so a null
+    // parameter contributes no bytes at all.
+    is_null: Bool
+
+// The value as the text a person reads.
+//
+// For a message, a log line, or a `SELECT` printed to a console.  NULL
+// renders as `NULL` and not as the empty string, because the two are
+// different values and a rendering that collapsed them would be the
+// same bug one layer up.
+//
+// ```novo
+// use mytype
+//
+// fn shown(v: MyValue) -> Str
+//     mytype.value_text(v)
+//
+// fn main() [io]
+//     println(mytype.value_text(MyNull))
+// ```
+pub fn value_text(v: MyValue) -> Str []
+    todo("mysql-nv.mytype.value_text")
+
+// Is this value NULL?
+//
+// ```novo
+// use mytype
+//
+// fn main() [io]
+//     println("${mytype.is_null(MyNull)}")
+// ```
+pub fn is_null(v: MyValue) -> Bool []
+    todo("mysql-nv.mytype.is_null")
+
+// The connection character set a client should ask for.
+//
+// `utf8mb4`, which is the one that holds every Unicode code point —
+// MySQL's `utf8` is three bytes per character and cannot hold an emoji
+// or most of the CJK extension blocks, and a connection that asked for
+// it truncates at the first four-byte character with a warning nobody
+// reads.
+//
+// ```novo
+// use mytype
+//
+// fn main() [io]
+//     println("${mytype.utf8mb4_collation()}")
+// ```
+pub fn utf8mb4_collation() -> Int []
+    todo("mysql-nv.mytype.utf8mb4_collation")
+
+// A date or a datetime, as calendar-nv's value.
+//
+// THE ONE PLACE THE TWO CALENDARS MEET.  MySQL's `DATETIME` has no time
+// zone at all and its `TIMESTAMP` is stored in UTC and rendered in the
+// session's `time_zone` — so the same column read by two connections
+// with different settings answers two different instants, and a driver
+// that handed back a bare integer would be handing back that trap with
+// a plausible name on it.  `civil.CivilDateTime` is the type that
+// cannot be read wrong: it is a wall-clock reading with no zone, which
+// is exactly what the server sent.
+//
+// `None` for a value that is not a date, and for `MyZeroDate` — because
+// `0000-00-00` is a value MySQL stores and no calendar has, and forcing
+// it into one would invent a day.
+//
+// ```novo
+// use mytype
+// use civil
+//
+// fn when(v: MyValue) -> Bool
+//     match mytype.to_civil(v)
+//         Some(d) => true
+//         None    => false
+//
+// fn main() [io]
+//     println("a MySQL datetime, as a civil one")
+// ```
+pub fn to_civil(v: MyValue) -> ?CivilDateTime []
+    todo("mysql-nv.mytype.to_civil")
+
+// A civil datetime, as the value a parameter binds.
+//
+// The inverse, and it produces `MyDateTime` rather than a string,
+// because the binary protocol sends a datetime in its own little-endian
+// layout and a driver that formatted it as text would be sending the
+// server a string to re-parse under whatever `sql_mode` is set.
+//
+// ```novo
+// use mytype
+// use civil
+//
+// fn bound(d: CivilDateTime) -> MyValue
+//     mytype.of_civil(d)
+//
+// fn main() [io]
+//     println("a civil datetime, as a bound parameter")
+// ```
+pub fn of_civil(d: CivilDateTime) -> MyValue []
+    todo("mysql-nv.mytype.of_civil")

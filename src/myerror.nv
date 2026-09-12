@@ -1,0 +1,239 @@
+// myerror.nv — what the server said, and what a caller can do about it.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// THE ERROR CODE AND THE SQLSTATE ARE TWO DIFFERENT ANSWERS AND A
+// CALLER NEEDS BOTH.  The error number is MySQL's own and is precise —
+// 1062 is a duplicate key, 1213 is a deadlock, 1205 is a lock wait
+// timeout — and the SQLSTATE is the five-character ANSI class that is
+// portable and vague, where all three of those are `40001` or `23000`.
+// A caller that branched on the SQLSTATE cannot tell a deadlock (retry
+// the transaction) from a lock wait timeout (do not), and one that
+// branched only on the number has written something that works on
+// MySQL and on nothing else.  Both are on the value.
+//
+// THE SQLSTATE IS NOT ALWAYS THERE.  It rides the error packet only
+// when the capabilities include `CLIENT_PROTOCOL_41`, which is why
+// reading an error takes the capabilities like every other decode in
+// this package, and why `sqlstate` is a `Str` that can be empty rather
+// than a type that pretends.
+//
+// RETRYABLE IS A PROPERTY OF THE ERROR AND NOT OF THE CALLER.  A
+// deadlock is the server telling one of two transactions to go again,
+// and re-running it is the correct response; a duplicate key is not,
+// and a retry loop over it is an infinite one.  `is_retryable` is that
+// list, published, because every application writes it and most of them
+// write it from memory.
+//
+// NOTHING HERE PERFORMS ANYTHING.  Every row in this module is `[]`.
+
+// What went wrong.
+//
+// The variants are what a caller BRANCHES on; the server's own error
+// number and SQLSTATE are on `MyServerError` for the cases where the
+// branch is not enough.
+pub enum MyFault
+    // The server refused or reported.
+    MyServer(error: MyServerError)
+    // A packet that was not what the exchange expected.
+    MyProtocol(detail: Str)
+    // The socket went away mid-exchange.  Distinct from a server error
+    // because there is no error number and no transaction status: a
+    // caller cannot know whether the statement ran.
+    MyConnectionLost(during: Str)
+    // A deadline passed.
+    MyTimedOut(operation: Str, ms: Int)
+    // Authentication.
+    MyAuth(detail: Str)
+    // TLS was asked for and the server does not offer it.  A refusal,
+    // because carrying on unencrypted is the silent downgrade the
+    // request existed to prevent.
+    MyTlsUnavailable
+
+// One error packet, whole.
+pub struct MyServerError
+    // MySQL's own number.  1062, 1213, 1205: precise, and the one to
+    // branch on when the answer is MySQL-specific.
+    code: Int
+    // The five-character ANSI class, or empty when the capabilities did
+    // not include it.  Portable and vague.
+    sqlstate: Str
+    message: Str
+
+// The standard `Error` implementation, so a database failure can be
+// reported by anything that reports errors.
+impl Error for MyFault
+    // One line: the error number, the SQLSTATE when there is one, and
+    // the server's message.
+    //
+    // The number is in the message rather than left to the caller,
+    // because a person reading a log searches for `1062` and finds
+    // nothing when only the text was printed.
+    fn message(self) -> Str
+        todo("mysql-nv.myerror.MyFault.message")
+
+// Read an error packet.
+//
+// The capabilities decide whether a SQLSTATE is there, which is why
+// they are a parameter.
+//
+// ```novo
+// use myerror
+// use mypacket
+//
+// fn what(buf: Bytes, p: MyPacket, c: MyCapabilities) -> MyServerError
+//     myerror.read_error(buf, p, c)
+//
+// fn main() [io]
+//     println("what the server refused")
+// ```
+pub fn read_error(buf: Bytes, p: MyPacket, c: MyCapabilities) -> MyServerError []
+    todo("mysql-nv.myerror.read_error")
+
+// Should this be tried again?
+//
+// Deadlock (1213) and lock wait timeout (1205) are the server asking a
+// transaction to go again, and re-running is correct; a duplicate key
+// is not, and a retry loop over it never ends.  Published because every
+// application writes this list and most of them write it from memory.
+//
+// The answer is about the STATEMENT, not the connection: a caller still
+// has to re-run the whole transaction, because the server rolled it
+// back.
+//
+// ```novo
+// use myerror
+//
+// fn again(e: MyServerError) -> Bool
+//     myerror.is_retryable(e)
+//
+// fn main() [io]
+//     println("whether to run the transaction again")
+// ```
+pub fn is_retryable(e: MyServerError) -> Bool []
+    todo("mysql-nv.myerror.is_retryable")
+
+// Did the server roll the transaction back?
+//
+// A deadlock does; a duplicate key does not.  The difference decides
+// whether a caller re-runs from the `BEGIN` or from the failing
+// statement, and a caller that assumed the second after a deadlock
+// commits half a transaction.
+//
+// ```novo
+// use myerror
+//
+// fn gone(e: MyServerError) -> Bool
+//     myerror.rolled_back(e)
+//
+// fn main() [io]
+//     println("whether the transaction survived")
+// ```
+pub fn rolled_back(e: MyServerError) -> Bool []
+    todo("mysql-nv.myerror.rolled_back")
+
+// Is this a constraint the application is expected to handle?
+//
+// A duplicate key on a unique index is an application-level answer —
+// "that email is taken" — and not a fault.  `23000` and its numbers.
+//
+// ```novo
+// use myerror
+//
+// fn taken(e: MyServerError) -> Bool
+//     myerror.is_constraint_violation(e)
+//
+// fn main() [io]
+//     println("whether a unique index refused a row")
+// ```
+pub fn is_constraint_violation(e: MyServerError) -> Bool []
+    todo("mysql-nv.myerror.is_constraint_violation")
+
+// Is this the connection going away rather than the statement failing?
+//
+// 2006 and 2013 — "server has gone away" and "lost connection" — plus
+// the shutdown codes.  A caller that retried one of these on the SAME
+// connection retries on a socket that is closed.
+//
+// ```novo
+// use myerror
+//
+// fn dead(e: MyServerError) -> Bool
+//     myerror.is_connection_error(e)
+//
+// fn main() [io]
+//     println("whether the connection is gone")
+// ```
+pub fn is_connection_error(e: MyServerError) -> Bool []
+    todo("mysql-nv.myerror.is_connection_error")
+
+// The error number for a duplicate key: 1062.
+//
+// Named rather than written at the call site, because the number is the
+// one every application branches on and a literal `1062` in a business
+// rule is a line nobody can search for.
+//
+// ```novo
+// use myerror
+//
+// fn main() [io]
+//     println("${myerror.error_duplicate_entry()}")
+// ```
+pub fn error_duplicate_entry() -> Int []
+    todo("mysql-nv.myerror.error_duplicate_entry")
+
+// The error number for a deadlock: 1213.
+//
+// ```novo
+// use myerror
+//
+// fn main() [io]
+//     println("${myerror.error_deadlock()}")
+// ```
+pub fn error_deadlock() -> Int []
+    todo("mysql-nv.myerror.error_deadlock")
+
+// The error number for a lock wait timeout: 1205.
+//
+// Separate from a deadlock, and the distinction matters: a deadlock
+// rolled the transaction back and a lock wait timeout rolled back only
+// the statement, so the two want different recovery.
+//
+// ```novo
+// use myerror
+//
+// fn main() [io]
+//     println("${myerror.error_lock_wait_timeout()}")
+// ```
+pub fn error_lock_wait_timeout() -> Int []
+    todo("mysql-nv.myerror.error_lock_wait_timeout")
+
+// A fault with no server behind it.
+//
+// ```novo
+// use myerror
+//
+// fn broken(detail: Str) -> MyFault
+//     myerror.protocol_fault(detail)
+//
+// fn main() [io]
+//     println("a packet the exchange did not expect")
+// ```
+pub fn protocol_fault(detail: Str) -> MyFault []
+    todo("mysql-nv.myerror.protocol_fault")
+
+// The server error behind a fault, when there is one.
+//
+// ```novo
+// use myerror
+//
+// fn behind(f: MyFault) -> Bool
+//     match myerror.server_error(f)
+//         Some(e) => true
+//         None    => false
+//
+// fn main() [io]
+//     println("the error number a fault carries")
+// ```
+pub fn server_error(f: MyFault) -> ?MyServerError []
+    todo("mysql-nv.myerror.server_error")

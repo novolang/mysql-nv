@@ -1,0 +1,100 @@
+[package]
+name        = "mysql-nv"
+license     = "Apache-2.0"
+version     = "0.0.1"
+description = "A MySQL and MariaDB client with no libmysqlclient: the packet framing and its sequence ids, caching_sha2_password and mysql_native_password over crypto-nv, the text and binary protocols, the column types, LOAD DATA LOCAL as a value the caller answers, TLS as a hook, a connection pool and a std.sql driver.  Interface only — every body is a todo()."
+
+# `license` sits immediately after the name, before any value that could
+# contain a square bracket.  The publish reads it with a pattern that
+# stops at the first `[`, so a description naming an effect row hides it
+# and the release records no licence at all — silently.
+
+# An INTERFACE release: every `pub fn` body is a `todo()`, so the
+# signatures and the effect rows are published and nothing is
+# implemented.  `novo pkg publish` recognises the shape and requires
+# both the draft stability and the 0.0.x version; the first
+# implementation is the 0.1.0 published over it.
+stability   = "draft"
+
+# `host`, and the split inside it is the point of the package.
+#
+# `mypacket`, `myauth`, `mytype` and `myerror` are `[]` throughout:
+# bytes in, messages out, messages in, bytes out, and not one socket.
+# That is what makes the protocol testable against captured exchanges
+# with no server running, and it is what lets the same codec serve a
+# client, a proxy and a test double.
+#
+# `myconn`, `myquery`, `mypool` and `mydriver` are the half that
+# connects.  They declare `[net]`, `[time]` where a deadline is
+# consulted, and nothing else; no module here prints, and `[fs]` is
+# absent on purpose — see the LOAD DATA note below.
+#
+# The `core` half is a MODULE split and not a package split, the same
+# call postgres-nv made and for the same reason: a codec whose only
+# consumer is the client beside it is a second package a reader has to
+# assemble, with no second caller to pay for it.  The row that would
+# change that is a MySQL wire PROXY — ProxySQL's shape, a
+# protocol-aware router — and if one is written, `mypacket` and
+# `mytype` move out under the name `my-codec-nv` with no signature
+# change.
+layer       = "host"
+
+category    = "databases"
+
+tags        = ["mysql", "mariadb", "wire-protocol", "database", "driver", "sql", "native-port"]
+repository  = "https://github.com/novolang/mysql-nv"
+maintainers = ["novo-lang"]
+novo        = ">= 0.8.9"
+
+# A library: no `main`, so `novo pkg build` type-checks and
+# effect-checks every module under `src/` and writes no binary.
+#
+# NO `[fs]`, AND THAT IS THE `LOAD DATA LOCAL INFILE` DECISION.  The
+# server can ask the client to send a file, at any path the client
+# process can read, mid-exchange.  A driver that honoured the request
+# would need `[fs]` and would hand any readable file to whatever it is
+# connected to.  So the request comes back to the CALLER as a value —
+# `MyLocalFileWanted(path)` — the caller decides and reads the bytes
+# itself, and `myquery.send_local_file` takes them.  The effect the
+# feature costs is spent in the caller's program, where a reader of its
+# manifest can see it.
+
+[docs.pages]
+"README.md" = "The wire, and the capabilities that decide what its bytes mean"
+
+[dependencies]
+# crypto-nv, and it is not optional: a MySQL 8 server answers
+# `caching_sha2_password` and nothing else, so a client without SHA-256
+# is a client that cannot log in.  What `myauth` uses is `sha256` (the
+# whole of the fast-path scramble and the full-authentication XOR),
+# `sha1` (the older `mysql_native_password` exchange, which is still
+# what MariaDB and MySQL 5.7 send), and `digest.ct_eq` for comparisons
+# against values a server controls.
+crypto-nv = "^0.1.1"
+
+# calendar-nv, for ONE type, and the reason is that the type is where
+# the trap is.  MySQL's `DATETIME` has no time zone and its `TIMESTAMP`
+# is stored in UTC and rendered in the session's zone — so the SAME
+# column read by two connections with different `time_zone` settings
+# answers two different instants, and a driver that handed back a bare
+# integer would be handing back the trap with a plausible name on it.
+# `civil.CivilDateTime` is the type that cannot be read wrong,
+# calendar-nv is `core` with no dependencies of its own, and `mytype` is
+# where the two calendars meet exactly once.
+calendar-nv = "^0.0.2"
+
+# NOT uuid-nv.  It depends on rand-nv, so naming `uuid.Uuid` in a
+# signature would put a random-number generator into every program that
+# selects a UUID column — and MySQL has no UUID type at all: the column
+# is a `CHAR(36)` or a `BINARY(16)`, so `MyText` and `MyBytes` already
+# carry it and a caller that wants uuid-nv's type calls
+# `uuid.from_bytes`, having chosen to.
+#
+# NOT a json package.  MySQL's `JSON` column is sent as text on the
+# wire, so `MyJson` carries it and `std.json` parses it.
+#
+# NOT tls-nv, which is planned and is not needed: TLS is a HOOK the
+# caller supplies — see `myconn.MyTransport` — because a driver that
+# chose a TLS implementation would make that choice for every program
+# that links it, and because MySQL's STARTTLS is one short packet
+# before any of it.

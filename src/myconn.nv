@@ -1,0 +1,439 @@
+// myconn.nv — the socket, the handshake, and the two policies that stop
+// a server from taking something it was not given.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// A CONNECTION CARRIES THE NEGOTIATED CAPABILITIES, AND EVERY DECODE
+// TAKES THEM.  Which is this package's whole shape: `mypacket`,
+// `mytype` and `myerror` are `[]` and take a `MyCapabilities`, and this
+// module is where that value comes from and lives.  A driver that
+// cached the wrong one reads a result set with the wrong terminator.
+//
+// TLS IS A HOOK AND NOT A DEPENDENCY, for the reason postgres-nv gives:
+// a driver that chose a TLS implementation would choose it for every
+// program that links the driver.  `MyTransport` is the seam — three
+// named functions that move bytes — and `plain_transport` is the
+// `std.net` pair.  MySQL's own STARTTLS is a short packet carrying the
+// capability flags and nothing else, so `negotiate_tls` is a separate
+// call with the caller's handshake between it and the real login.  A
+// client that sent its username in that first packet has sent it in the
+// clear.
+//
+// `MySslMode` HAS FIVE VALUES AND NO DEFAULT, because a server that
+// does not offer TLS has not FAILED — it has said no, and a client that
+// carried on has silently downgraded a connection somebody asked to
+// encrypt.
+//
+// `local_infile` IS OFF, AND THE README ARGUES IT.  `LOAD DATA LOCAL
+// INFILE` lets the SERVER ask the CLIENT to send a file, and a
+// compromised or hostile server can ask for any path the client process
+// can read.  The complete defence is not to negotiate
+// `CLIENT_LOCAL_FILES` at all, which is what `false` here does; the
+// partial one, for a caller that needs the feature, is a directory the
+// request must be inside.  Both are on the options, and neither is a
+// default that surprises anybody.
+//
+// `[net]`, AND `[time]` WHERE A DEADLINE IS CONSULTED.  `std.net`'s
+// free functions declare `[net]` alone and no module here prints, so
+// `[io]` is not owed.
+
+// What the caller wants done about TLS.
+pub enum MySslMode
+    // Never ask.  The only honest mode for a Unix socket.
+    MySslDisable
+    // Ask, and carry on in the clear if the server says no.
+    // Encryption when it is free, and no guarantee — which is worth
+    // having and is not security.
+    MySslPrefer
+    // Ask, and refuse the connection if the server says no.
+    MySslRequire
+    // As require, and also check that the certificate chains to a
+    // trusted root.  The checking is the caller's transport's.
+    MySslVerifyCa
+    // As verify-ca, and also check that the certificate names the host
+    // asked for.  The only mode that resists an active attacker, and
+    // the reason the weaker ones have to be named rather than
+    // defaulted into.
+    MySslVerifyIdentity
+
+// What a client will do if the server asks it for a file.
+pub enum MyLocalInfile
+    // Never.  `CLIENT_LOCAL_FILES` is not negotiated, so the server
+    // cannot ask — which is the only complete defence and is the
+    // default.
+    MyLocalInfileOff
+    // Only paths inside this directory, checked after resolving `..`
+    // and symbolic links.  For a caller that genuinely bulk-loads.
+    MyLocalInfileUnder(directory: Str)
+
+// How bytes get to the server and back.
+//
+// The seam TLS goes through.  A caller that wants plaintext uses
+// `plain_transport`; one that wants TLS wraps its own handshake and
+// supplies these three.
+//
+// The functions are NAMED FUNCTIONS and not lambdas: a lambda that
+// becomes a value is refused at `@tier(embedded)`, and while this
+// package makes no device claim, the shape is the one the rest of the
+// grid uses and there is no reason for this to be the exception.
+pub struct MyTransport
+    // Send every byte, or answer the fault.  `handle` is whatever the
+    // caller's connect produced — a socket for plaintext, a session for
+    // TLS.
+    send: fn(Int, Bytes) -> ?MyFault
+    // Read up to `n` bytes.  An empty answer means the peer closed.
+    recv: fn(Int, Int) -> Result<Bytes, MyFault>
+    // Close it.
+    close: fn(Int) -> ?MyFault
+
+// Where and as whom to connect.
+pub struct MyConnectOptions
+    // A host name or address, or a filesystem path for a Unix socket —
+    // `std.net`'s `unix_connect` takes the same handle type, so one
+    // field covers both and `is_unix_socket` is the question.
+    host: Str
+    port: Int
+    user: Str
+    password: Str
+    database: Str
+    // The connection character set.  `utf8mb4`, or a connection that
+    // truncates at the first four-byte character.
+    collation: Int
+    ssl_mode: MySslMode
+    local_infile: MyLocalInfile
+    // Allow the `caching_sha2_password` full-authentication path to
+    // send the password over a socket that is not encrypted.  False,
+    // because the alternative is handing the password to the path.
+    allow_cleartext: Bool
+    // The server's RSA public key, pinned out of band.  Empty means
+    // none, and a client with none refuses the key the server offers —
+    // fetching it over the same unencrypted socket authenticates
+    // nothing.
+    pinned_public_key: Bytes
+    // Refuse a packet larger than this.  A `LONGBLOB` row can
+    // legitimately be large, so the ceiling is the caller's rather than
+    // a constant.
+    max_packet_bytes: Int
+    connect_timeout_ms: Int
+    read_timeout_ms: Int
+
+// An open connection.
+pub struct MyConn
+    // The handle the transport's connect produced.
+    handle: Int
+    transport: MyTransport
+    options: MyConnectOptions
+    // WHAT BOTH ENDS AGREED.  Every decode in this package takes it,
+    // and this field is where it lives.
+    capabilities: MyCapabilities
+    // The server's thread id, for `kill_query` — which is a SECOND
+    // connection, because MySQL cancels a running statement by sending
+    // `KILL QUERY <id>` from somewhere else.
+    connection_id: Int
+    // The server's version string, because the wire has version-gated
+    // behaviour and a caller debugging one wants to see it.
+    server_version: Str
+    // The sequence number the next packet must carry.
+    seq: MySeq
+    // Bytes read and not yet framed.  A socket read is not a packet.
+    inbox: Bytes
+    // The status flags from the last OK packet — where a transaction's
+    // state lives in this protocol, there being no `ReadyForQuery`.
+    status_flags: Int
+    // True once the connection is unusable.
+    broken: Bool
+
+// The plaintext transport over `std.net`.
+//
+// ```novo
+// use myconn
+//
+// fn main() [io]
+//     let t = myconn.plain_transport()
+//     println("ready")
+// ```
+pub fn plain_transport() -> MyTransport
+    todo("mysql-nv.myconn.plain_transport")
+
+// A transport the caller assembled: a TLS session's three functions.
+//
+// ```novo
+// use myconn
+//
+// fn over(send: fn(Int, Bytes) -> ?MyFault, recv: fn(Int, Int) -> Result<Bytes, MyFault>,
+//         close: fn(Int) -> ?MyFault) -> MyTransport
+//     myconn.transport(send, recv, close)
+//
+// fn main() [io]
+//     println("bytes, somebody else's way")
+// ```
+pub fn transport(send: fn(Int, Bytes) -> ?MyFault, recv: fn(Int, Int) -> Result<Bytes, MyFault>,
+                 close: fn(Int) -> ?MyFault) -> MyTransport
+    todo("mysql-nv.myconn.transport")
+
+// The defaults a caller edits.
+//
+// Port 3306, `utf8mb4`, TLS preferred, local-infile OFF, cleartext
+// refused, a 16 MB packet ceiling and a ten-second connect timeout.
+//
+// ```novo
+// use myconn
+//
+// fn options() -> MyConnectOptions
+//     myconn.default_options("app")
+//
+// fn main() [io]
+//     println("where to connect, and as whom")
+// ```
+pub fn default_options(user: Str) -> MyConnectOptions
+    todo("mysql-nv.myconn.default_options")
+
+// Is this host a filesystem path rather than a name?
+//
+// The rule that decides between `net.connect` and `net.unix_connect`,
+// and the reason one field covers both.
+//
+// ```novo
+// use myconn
+//
+// fn main() [io]
+//     println("${myconn.is_unix_socket("/var/run/mysqld/mysqld.sock")}")
+// ```
+pub fn is_unix_socket(host: Str) -> Bool
+    todo("mysql-nv.myconn.is_unix_socket")
+
+// Connect and log in.
+//
+// The whole handshake: read the greeting, negotiate TLS if the mode
+// asks for it, send the login, answer whatever the plugin wants, and
+// stop with a fault rather than downgrade.
+//
+// ```novo
+// use myconn
+//
+// fn open(o: MyConnectOptions) -> Result<MyConn, MyFault> [net, time]
+//     myconn.connect(o, myconn.plain_transport())
+//
+// fn main() [io]
+//     println("a connection, or a reason there is not one")
+// ```
+pub fn connect(o: MyConnectOptions, t: MyTransport) -> Result<MyConn, MyFault> [net, time]
+    todo("mysql-nv.myconn.connect")
+
+// Ask the server to start TLS, and say whether it agreed.
+//
+// A separate call because the caller's own handshake goes between it
+// and the login: this sends the short capability packet, the caller
+// wraps the socket, and `connect` continues inside the encrypted
+// channel.  `false` means the server said no, which `MySslRequire` and
+// above must treat as a refusal.
+//
+// ```novo
+// use myconn
+//
+// fn start(c: MyConn) -> Result<Bool, MyFault> [net, time]
+//     myconn.negotiate_tls(c)
+//
+// fn main() [io]
+//     println("whether the server will encrypt")
+// ```
+pub fn negotiate_tls(c: MyConn) -> Result<Bool, MyFault> [net, time]
+    todo("mysql-nv.myconn.negotiate_tls")
+
+// Read the next whole packet, framing across socket reads.
+//
+// A socket read is not a packet — it is a packet and a half about as
+// often as it is a packet — and a 16 MB payload is several.  This is
+// where both are handled, and it is the only read in the package.
+//
+// ```novo
+// use myconn
+// use mypacket
+//
+// fn next(c: MyConn) -> Result<MyReadPacket, MyFault> [net, time]
+//     myconn.next_packet(c)
+//
+// fn main() [io]
+//     println("the next thing the server said")
+// ```
+pub fn next_packet(c: MyConn) -> Result<MyReadPacket, MyFault> [net, time]
+    todo("mysql-nv.myconn.next_packet")
+
+// One packet, and the connection it came from.
+//
+// The buffer travels with the packet because the packet's fields are
+// RANGES into it, and a caller holding one without the other holds
+// offsets into nothing.
+pub struct MyReadPacket
+    conn: MyConn
+    buffer: Bytes
+    packet: MyPacket
+
+// Send a command packet, resetting the sequence number.
+//
+// The reset is here rather than at the call sites because "sequence
+// starts at zero for each command" is the rule, and a caller that wrote
+// it in one place and forgot it in another gets `Packets out of order`
+// on the second statement.
+//
+// ```novo
+// use myconn
+//
+// fn send(c: MyConn, payload: Bytes) -> Result<MyConn, MyFault> [net, time]
+//     myconn.send_command(c, payload)
+//
+// fn main() [io]
+//     println("a command, sent")
+// ```
+pub fn send_command(c: MyConn, payload: Bytes) -> Result<MyConn, MyFault> [net, time]
+    todo("mysql-nv.myconn.send_command")
+
+// `COM_PING`: is the connection still there?
+//
+// What a pool asks before it lends one out.
+//
+// ```novo
+// use myconn
+//
+// fn alive(c: MyConn) -> Result<MyConn, MyFault> [net, time]
+//     myconn.ping(c)
+//
+// fn main() [io]
+//     println("whether a connection is still good")
+// ```
+pub fn ping(c: MyConn) -> Result<MyConn, MyFault> [net, time]
+    todo("mysql-nv.myconn.ping")
+
+// `COM_RESET_CONNECTION`: forget everything session-local.
+//
+// Temporary tables, user variables, prepared statements, the current
+// database, and an open transaction.  What a pool must do before it
+// lends a connection to somebody else, and the reason it is published:
+// a pool that returned a connection mid-transaction puts the next
+// borrower inside somebody else's.
+//
+// ```novo
+// use myconn
+//
+// fn clean(c: MyConn) -> Result<MyConn, MyFault> [net, time]
+//     myconn.reset_session(c)
+//
+// fn main() [io]
+//     println("a connection, made anonymous again")
+// ```
+pub fn reset_session(c: MyConn) -> Result<MyConn, MyFault> [net, time]
+    todo("mysql-nv.myconn.reset_session")
+
+// Change the current database.
+//
+// ```novo
+// use myconn
+//
+// fn use_db(c: MyConn) -> Result<MyConn, MyFault> [net, time]
+//     myconn.select_database(c, "appdb")
+//
+// fn main() [io]
+//     println("a different schema")
+// ```
+pub fn select_database(c: MyConn, database: Str) -> Result<MyConn, MyFault> [net, time]
+    todo("mysql-nv.myconn.select_database")
+
+// `COM_QUIT`, then close the socket.
+//
+// ```novo
+// use myconn
+//
+// fn done(c: MyConn) [net, time]
+//     myconn.close(c)
+//
+// fn main() [io]
+//     println("a connection, closed politely")
+// ```
+pub fn close(c: MyConn) [net, time]
+    todo("mysql-nv.myconn.close")
+
+// Cancel a statement running on another connection.
+//
+// MySQL has no out-of-band cancel: `KILL QUERY <id>` is an ordinary
+// statement, sent from a SECOND connection, naming the first's
+// `connection_id`.  That is a genuine difference from PostgreSQL's
+// cancel request, and it means a caller that wants cancellation has to
+// be able to open another connection at the moment it is needed — which
+// is why the thread id is on `MyConn` from the handshake rather than
+// looked up.
+//
+// ```novo
+// use myconn
+//
+// fn stop(other: MyConn, id: Int) -> Result<MyConn, MyFault> [net, time]
+//     myconn.kill_query(other, id)
+//
+// fn main() [io]
+//     println("somebody else's statement, stopped")
+// ```
+pub fn kill_query(on: MyConn, connection_id: Int) -> Result<MyConn, MyFault> [net, time]
+    todo("mysql-nv.myconn.kill_query")
+
+// The thread id a `KILL QUERY` would name.
+//
+// ```novo
+// use myconn
+//
+// fn id(c: MyConn) -> Int
+//     myconn.connection_id(c)
+//
+// fn main() [io]
+//     println("the id another connection would kill")
+// ```
+pub fn connection_id(c: MyConn) -> Int
+    todo("mysql-nv.myconn.connection_id")
+
+// What both ends agreed.
+//
+// Published because every decode in this package takes it, and a caller
+// reading packets itself needs the same value the connection used.
+//
+// ```novo
+// use myconn
+// use mypacket
+//
+// fn agreed(c: MyConn) -> MyCapabilities
+//     myconn.capabilities(c)
+//
+// fn main() [io]
+//     println("what this connection speaks")
+// ```
+pub fn capabilities(c: MyConn) -> MyCapabilities
+    todo("mysql-nv.myconn.capabilities")
+
+// Is a transaction open on this connection?
+//
+// From the last OK packet's status flags, which is where this protocol
+// keeps it.  The question a pool must ask before it takes a connection
+// back.
+//
+// ```novo
+// use myconn
+//
+// fn open(c: MyConn) -> Bool
+//     myconn.in_transaction(c)
+//
+// fn main() [io]
+//     println("whether a transaction is open")
+// ```
+pub fn in_transaction(c: MyConn) -> Bool
+    todo("mysql-nv.myconn.in_transaction")
+
+// Is this connection unusable?
+//
+// ```novo
+// use myconn
+//
+// fn dead(c: MyConn) -> Bool
+//     myconn.is_broken(c)
+//
+// fn main() [io]
+//     println("whether a connection can be reused")
+// ```
+pub fn is_broken(c: MyConn) -> Bool
+    todo("mysql-nv.myconn.is_broken")

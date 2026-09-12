@@ -1,0 +1,269 @@
+// mypool.nv — a pool that is a value, and the reset that makes one
+// safe.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// A POOL IS A VALUE, SO IT SYNCHRONISES NOTHING AND CANNOT.  Two tasks
+// sharing one share it the way they share any other value in this
+// language; `cell.pool` is how novo-lang programs own shared state, and
+// a pool per cell with no sharing is the shape that actually runs.
+// That is postgres-nv's decision and this package makes the same one
+// for the same reason.
+//
+// THE CLOCK IS THE CALLER'S ARGUMENT.  `acquire` and `release` take the
+// current time in milliseconds, which is what lets a test age a pool
+// without sleeping and is why `[time]` appears on the calls that talk
+// to a server rather than on the policy.
+//
+// RETURNING A CONNECTION MID-TRANSACTION PUTS THE NEXT BORROWER INSIDE
+// SOMEBODY ELSE'S.  MySQL keeps more session state than PostgreSQL —
+// temporary tables, user variables, prepared statements, the current
+// database, `SET` variables, and the transaction — and every one of
+// them survives a `release`.  `COM_RESET_CONNECTION` clears all of it in
+// one round trip, and this pool runs it rather than trusting a caller
+// to have tidied up.  A server too old for that command gets the
+// `SET`-based fallback, and `resets_on_release` says which is in use,
+// because the difference is a real one and a caller running against an
+// old server should know its connections carry state.
+
+use myconn
+
+// What a pool will and will not do.
+pub struct MyPoolPolicy
+    // The most connections to hold open.  A pool with no limit is a
+    // pool that answers a traffic spike by exhausting the server's
+    // `max_connections`, which takes down everything else on it.
+    max_connections: Int
+    // How long to wait for one to come free before giving up.  Zero
+    // means answer immediately, which is what a request handler with
+    // its own deadline wants.
+    acquire_timeout_ms: Int
+    // Close an idle connection older than this.  A connection idle for
+    // an hour has probably been dropped by a firewall or by the
+    // server's own `wait_timeout`, and finding out at the next query is
+    // an error the application sees.
+    max_idle_ms: Int
+    // Close a connection this old however busy it is, so a rolling
+    // restart of the servers behind a proxy drains rather than pins.
+    max_lifetime_ms: Int
+    // `COM_PING` before lending out a connection idle longer than this.
+    // One round trip against a stale connection's error.
+    ping_after_idle_ms: Int
+
+// A pool.
+pub struct MyPool
+    policy: MyPoolPolicy
+    options: MyConnectOptions
+    transport: MyTransport
+    idle: [MyConn]
+    // When each idle connection was returned, same order as `idle`.
+    idle_since_ms: [Int]
+    // When each was opened, for `max_lifetime_ms`.
+    opened_at_ms: [Int]
+    // How many are out on loan.  Counted rather than held, because a
+    // borrowed connection is the borrower's and the pool has nothing to
+    // do with it until it comes back.
+    borrowed: Int
+
+// The defaults a caller edits: ten connections, a five-second wait, ten
+// minutes idle, an hour of life, a ping after thirty seconds idle.
+//
+// ```novo
+// use mypool
+//
+// fn policy() -> MyPoolPolicy
+//     mypool.default_policy()
+//
+// fn main() [io]
+//     println("${mypool.default_policy().max_connections}")
+// ```
+pub fn default_policy() -> MyPoolPolicy []
+    todo("mysql-nv.mypool.default_policy")
+
+// An empty pool.
+//
+// Opens nothing: the first `acquire` makes the first connection, so a
+// program that never queries never connects.
+//
+// ```novo
+// use mypool
+// use myconn
+//
+// fn make() -> MyPool
+//     mypool.pool(myconn.default_options("app"), myconn.plain_transport(),
+//                 mypool.default_policy())
+//
+// fn main() [io]
+//     println("a pool with nothing in it yet")
+// ```
+pub fn pool(o: MyConnectOptions, t: MyTransport, p: MyPoolPolicy) -> MyPool []
+    todo("mysql-nv.mypool.pool")
+
+// Take a connection.
+//
+// Reuses an idle one when there is a usable one, opens a new one when
+// the limit allows, and waits otherwise.  `now_ms` is the caller's
+// clock reading, which is what lets a test age a pool without sleeping.
+//
+// ```novo
+// use mypool
+//
+// fn borrow(p: MyPool) -> Result<MyBorrow, MyFault> [net, time]
+//     mypool.acquire(p, 0)
+//
+// fn main() [io]
+//     println("a connection, from the pool")
+// ```
+pub fn acquire(p: MyPool, now_ms: Int) -> Result<MyBorrow, MyFault> [net, time]
+    todo("mysql-nv.mypool.acquire")
+
+// A borrowed connection, and the pool it came from.
+pub struct MyBorrow
+    pool: MyPool
+    conn: MyConn
+
+// Give a connection back.
+//
+// Runs `COM_RESET_CONNECTION` first, because MySQL keeps session state
+// a `release` would otherwise hand to the next borrower: temporary
+// tables, user variables, prepared statements, the current database and
+// an open transaction.
+//
+// A connection that is `broken`, or still inside a transaction that the
+// reset could not clear, is CLOSED rather than pooled.
+//
+// ```novo
+// use mypool
+//
+// fn give_back(p: MyPool, c: MyConn) -> Result<MyPool, MyFault> [net, time]
+//     mypool.release(p, c, 0)
+//
+// fn main() [io]
+//     println("a connection, made anonymous and returned")
+// ```
+pub fn release(p: MyPool, c: MyConn, now_ms: Int) -> Result<MyPool, MyFault> [net, time]
+    todo("mysql-nv.mypool.release")
+
+// Throw a connection away rather than pooling it.
+//
+// The answer when a statement failed in a way that leaves the
+// connection's state unknown — a protocol fault, a read timeout in the
+// middle of a result set — and a different answer from `release`,
+// because pooling one of those hands the next borrower an unread result
+// set.
+//
+// ```novo
+// use mypool
+//
+// fn bin(p: MyPool, c: MyConn) -> MyPool [net, time]
+//     mypool.discard(p, c)
+//
+// fn main() [io]
+//     println("a connection nobody should reuse")
+// ```
+pub fn discard(p: MyPool, c: MyConn) -> MyPool [net, time]
+    todo("mysql-nv.mypool.discard")
+
+// Close every idle connection past its age, and answer how many went.
+//
+// The maintenance call a program runs on a timer.  Separate from
+// `acquire` because a pool that only pruned on acquire keeps a hundred
+// dead connections through a quiet night and finds out at the morning's
+// first request.
+//
+// ```novo
+// use mypool
+//
+// fn tidy(p: MyPool) -> MyPruned [net, time]
+//     mypool.prune(p, 0)
+//
+// fn main() [io]
+//     println("the idle connections that had aged out")
+// ```
+pub fn prune(p: MyPool, now_ms: Int) -> MyPruned [net, time]
+    todo("mysql-nv.mypool.prune")
+
+// The pool after a prune, and how many it closed.
+pub struct MyPruned
+    pool: MyPool
+    closed: Int
+
+// Close everything.
+//
+// ```novo
+// use mypool
+//
+// fn shut(p: MyPool) [net, time]
+//     mypool.close_all(p)
+//
+// fn main() [io]
+//     println("a pool, emptied")
+// ```
+pub fn close_all(p: MyPool) [net, time]
+    todo("mysql-nv.mypool.close_all")
+
+// How many connections are idle.
+//
+// ```novo
+// use mypool
+//
+// fn waiting(p: MyPool) -> Int
+//     mypool.idle_count(p)
+//
+// fn main() [io]
+//     println("how many connections are free")
+// ```
+pub fn idle_count(p: MyPool) -> Int []
+    todo("mysql-nv.mypool.idle_count")
+
+// How many are out on loan.
+//
+// ```novo
+// use mypool
+//
+// fn busy(p: MyPool) -> Int
+//     mypool.borrowed_count(p)
+//
+// fn main() [io]
+//     println("how many connections are in use")
+// ```
+pub fn borrowed_count(p: MyPool) -> Int []
+    todo("mysql-nv.mypool.borrowed_count")
+
+// Would this idle connection be handed out now, or has it aged out?
+//
+// Published because the policy is the interesting part of a pool and a
+// caller tuning one wants to ask the question without borrowing.
+//
+// ```novo
+// use mypool
+//
+// fn usable(p: MyPool) -> Bool
+//     mypool.idle_is_usable(p, 0, 0)
+//
+// fn main() [io]
+//     println("whether an idle connection would still be lent out")
+// ```
+pub fn idle_is_usable(p: MyPool, index: Int, now_ms: Int) -> Bool []
+    todo("mysql-nv.mypool.idle_is_usable")
+
+// Does this pool clear session state with `COM_RESET_CONNECTION`, or
+// with the `SET`-based fallback?
+//
+// A server older than 5.7.3 has no such command, and the fallback
+// clears less — user variables and the current database, not temporary
+// tables.  A caller running against one should know its pooled
+// connections carry state, and a boolean nobody published is a fact
+// nobody knows.
+//
+// ```novo
+// use mypool
+//
+// fn thorough(p: MyPool) -> Bool
+//     mypool.resets_on_release(p)
+//
+// fn main() [io]
+//     println("whether a returned connection is really anonymous")
+// ```
+pub fn resets_on_release(p: MyPool) -> Bool []
+    todo("mysql-nv.mypool.resets_on_release")

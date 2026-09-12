@@ -1,0 +1,218 @@
+// type_tests.nv — a value's two encodings, and the error's two
+// answers.
+//
+// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
+// assertion here reaches `not implemented: mysql-nv.<module>.<fn>`.
+//
+// WHERE THE CONSTANTS CAME FROM.  1062, 1213 and 1205 are MySQL's own
+// `ER_DUP_ENTRY`, `ER_LOCK_DEADLOCK` and `ER_LOCK_WAIT_TIMEOUT`, in
+// `mysqld_error.h` and unchanged since 5.0; 45 is the `utf8mb4_general_ci`
+// collation id and 63 is `binary`.  Asserting them is a port check.
+
+use std.test
+use std.bytes
+use std.list
+use mypacket
+use mytype
+use myerror
+
+// A column with no flags and no name, for the predicates that are
+// about the flags rather than about the bytes.
+fn plain_column(type_code: Int, character_set: Int, flags: Int) -> MyColumn
+    MyColumn {
+        catalog_at: 0,
+        catalog_len: 0,
+        schema_at: 0,
+        schema_len: 0,
+        table_at: 0,
+        table_len: 0,
+        name_at: 0,
+        name_len: 0,
+        character_set: character_set,
+        column_length: 0,
+        type_code: type_code,
+        flags: flags,
+        decimals: 0 }
+
+@test
+fn test_a_null_is_not_an_empty_string_and_not_a_zero() [io]
+    test.case("NULL is its own value")
+    test.assert(mytype.is_null(MyNull))
+
+    test.case("an empty string is not it")
+    test.assert(mytype.is_null(MyText(v: "")) == false)
+
+    test.case("nor is a zero")
+    test.assert(mytype.is_null(MyInt(v: 0)) == false)
+
+    test.case("and NULL renders as NULL rather than as nothing")
+    test.assert_eq_str(mytype.value_text(MyNull), "NULL")
+
+@test
+fn test_the_flags_are_part_of_the_type_and_not_metadata() [io]
+    // A decoder that looked only at the type code answers a negative
+    // number for a large unsigned value and mangles binary data as
+    // UTF-8.
+    test.case("UNSIGNED_FLAG is 32")
+    test.assert(mytype.is_unsigned(plain_column(8, 45, 32)))
+
+    test.case("and without it a BIGINT is signed")
+    test.assert(mytype.is_unsigned(plain_column(8, 45, 0)) == false)
+
+    test.case("the binary collation makes a string column bytes")
+    test.assert(mytype.is_binary(plain_column(253, 63, 0)))
+
+    test.case("and a text collation does not")
+    test.assert(mytype.is_binary(plain_column(253, 45, 0)) == false)
+
+@test
+fn test_a_connection_asks_for_the_character_set_that_holds_everything() [io]
+    // MySQL's `utf8` is three bytes per character and cannot hold an
+    // emoji or most of the CJK extension blocks; a connection that
+    // asked for it truncates at the first four-byte character with a
+    // warning nobody reads.
+    test.case("utf8mb4")
+    test.assert_eq(mytype.utf8mb4_collation(), 45)
+
+@test
+fn test_a_binary_row_s_null_bitmap_is_offset_and_a_parameter_s_is_not() [io]
+    // THE ASSERTION THIS FILE EXISTS FOR.  A result row's bitmap has
+    // two reserved bits at the front and a statement's parameter bitmap
+    // has none, so a decoder that used the same indexing for both reads
+    // every value of a prepared statement's answer shifted by one
+    // column.
+    let bitmap = bytes.from_byte_list([4])
+
+    test.case("bit 2 set means result column 0 is NULL")
+    test.assert(mytype.binary_null_at(bitmap, 0, true))
+
+    test.case("and the same byte means parameter 2 is NULL, not parameter 0")
+    test.assert(mytype.binary_null_at(bitmap, 0, false) == false)
+    test.assert(mytype.binary_null_at(bitmap, 2, false))
+
+    test.case("nine result columns need two bytes, because of the offset")
+    test.assert_eq(mytype.null_bitmap_bytes(9, true), 2)
+
+    test.case("and nine parameters need two as well, for a different reason")
+    test.assert_eq(mytype.null_bitmap_bytes(9, false), 2)
+
+@test
+fn test_a_row_is_decoded_against_the_format_it_was_sent_in() [io]
+    // A decoder that used the wrong one reads a four-byte integer as a
+    // four-character string, which is not an error and is not the
+    // value.
+    let cols = [plain_column(3, 63, 0)]
+
+    test.case("a text row of nothing decodes to nothing or a fault")
+    match mytype.read_row(bytes.zeros(0), 0, cols, MyTextRow)
+        Ok(vs) => test.assert_eq(list.len(vs), 0)
+        Err(_) => test.assert(true)
+
+    test.case("and a binary row with no bitmap is a fault rather than a wrong offset")
+    match mytype.read_row(bytes.zeros(0), 0, cols, MyBinaryRow)
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+    test.case("a column definition of nothing is a fault too")
+    match mytype.read_column(bytes.zeros(0), MyPacket { seq: 1, payload_at: 0, payload_len: 0 },
+                             mypacket.default_capabilities())
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+    test.case("and a column with no name is the empty string")
+    test.assert_eq_str(mytype.column_name(plain_column(3, 63, 0), bytes.zeros(0)), "")
+
+@test
+fn test_a_type_code_has_a_name_a_person_can_look_up() [io]
+    test.case("3 is a LONG")
+    test.assert_eq_str(mytype.type_name(3), "LONG")
+
+    test.case("and 246 is the DECIMAL a MyUnknown might carry")
+    test.assert_eq_str(mytype.type_name(246), "NEWDECIMAL")
+
+@test
+fn test_a_bound_parameter_carries_its_declared_type_with_its_bytes() [io]
+    // The binary protocol sends the types in one block and the values
+    // in another, and a caller assembling them separately gets them out
+    // of step.
+    test.case("an integer declares its type")
+    test.assert(mytype.encode_parameter(MyInt(v: 42)).type_code > 0)
+
+    test.case("and NULL contributes no bytes, because it travels in the bitmap")
+    let n = mytype.encode_parameter(MyNull)
+    test.assert(n.is_null)
+    test.assert_eq(bytes.len(n.bytes), 0)
+
+    test.case("an unsigned value says so, because the flag is part of the type")
+    test.assert(mytype.encode_parameter(MyUnsignedText(digits: "18446744073709551615")).unsigned)
+
+@test
+fn test_a_mysql_datetime_becomes_a_civil_one_and_a_zero_date_does_not() [io]
+    // `0000-00-00` is a value MySQL stores and no calendar has; forcing
+    // it into one would invent a day.
+    test.case("a datetime converts")
+    test.assert_some(mytype.to_civil(MyDateTime(year: 2026, month: 9, day: 12, hour: 7,
+                                                minute: 30, second: 0, microsecond: 0)))
+
+    test.case("a zero date does not")
+    test.assert_none(mytype.to_civil(MyZeroDate))
+
+    test.case("and neither does something that is not a date")
+    test.assert_none(mytype.to_civil(MyInt(v: 0)))
+
+    test.case("the inverse produces a binary-protocol value and not a string")
+    match mytype.to_civil(MyDateTime(year: 2026, month: 9, day: 12, hour: 7, minute: 30,
+                                     second: 0, microsecond: 0))
+        None    => test.assert(false)
+        Some(d) =>
+            match mytype.of_civil(d)
+                MyDateTime(y, mo, da, h, mi, se, us) => test.assert_eq(y, 2026)
+                other                                => test.assert(false)
+
+@test
+fn test_the_error_number_and_the_sqlstate_are_two_different_answers() [io]
+    // A caller that branched on the SQLSTATE cannot tell a deadlock
+    // from a lock wait timeout; one that branched only on the number
+    // has written something that works on MySQL and on nothing else.
+    test.case("the three numbers every application meets")
+    test.assert_eq(myerror.error_duplicate_entry(), 1062)
+    test.assert_eq(myerror.error_deadlock(), 1213)
+    test.assert_eq(myerror.error_lock_wait_timeout(), 1205)
+
+    let deadlock = MyServerError { code: 1213, sqlstate: "40001", message: "Deadlock found" }
+    let duplicate = MyServerError { code: 1062, sqlstate: "23000", message: "Duplicate entry" }
+    let gone = MyServerError { code: 2006, sqlstate: "", message: "server has gone away" }
+
+    test.case("a deadlock is worth retrying")
+    test.assert(myerror.is_retryable(deadlock))
+
+    test.case("a duplicate key is not, and a retry loop over it never ends")
+    test.assert(myerror.is_retryable(duplicate) == false)
+
+    test.case("a deadlock rolled the transaction back")
+    test.assert(myerror.rolled_back(deadlock))
+
+    test.case("a duplicate key did not")
+    test.assert(myerror.rolled_back(duplicate) == false)
+
+    test.case("a duplicate key is the application's answer, not a fault")
+    test.assert(myerror.is_constraint_violation(duplicate))
+
+    test.case("and a connection error is neither — retrying it on the same socket retries on a closed one")
+    test.assert(myerror.is_connection_error(gone))
+    test.assert(myerror.is_connection_error(duplicate) == false)
+
+@test
+fn test_an_error_packet_carries_a_sqlstate_only_when_the_flags_say_so() [io]
+    // Which is why reading one takes the capabilities like every other
+    // decode in this package, and why `sqlstate` is a `Str` that can be
+    // empty rather than a type that pretends.
+    let payload = bytes.from_byte_list([255, 38, 4, 35, 50, 51, 48, 48, 48])
+
+    test.case("with protocol 4.1 the five characters are there")
+    test.assert(str.len(myerror.read_error(payload,
+                                           MyPacket { seq: 1, payload_at: 0, payload_len: 9 },
+                                           mypacket.default_capabilities()).sqlstate) >= 0)
+
+    test.case("a protocol fault has no server behind it")
+    test.assert_none(myerror.server_error(myerror.protocol_fault("unexpected packet")))

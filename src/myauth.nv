@@ -1,0 +1,345 @@
+// myauth.nv — logging in, and the two ways this protocol can be made
+// to send a password in the clear.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// `[]` THROUGHOUT, AND THE NONCE IS THE CALLER'S ARGUMENT.  No socket,
+// no clock, no randomness: the server's 20-byte scramble comes IN as a
+// parameter, so the whole handshake reproduces byte for byte from a
+// captured exchange.  That is the only way to know a scramble is right
+// — a wrong one fails to log in, and every wrong one fails to log in
+// identically.
+//
+// `caching_sha2_password` HAS A FAST PATH AND A SLOW PATH, AND THE SLOW
+// PATH IS WHERE THE PASSWORD GOES.  The fast path is a scramble the
+// server can check against its cache and is safe on a plain socket.
+// When the cache misses — a fresh server, a restarted one, the first
+// connection for a user — the server asks for FULL AUTHENTICATION, and
+// the client must then send the password where the server can read it:
+// in the clear over TLS, or RSA-encrypted under the server's public key
+// over a plain socket.  A client that answered the full-authentication
+// request by sending the password over an unencrypted socket has handed
+// it to anything on the path, and a client that fetches the server's
+// public key over that same unencrypted socket has handed it to
+// whoever is in the middle.  `MyFullAuth` is the decision point, it is
+// returned rather than taken, and `my_native_scramble`'s comment says
+// which of the two branches is which.
+//
+// `mysql_native_password` IS SHA-1 AND IT IS SUPPORTED BECAUSE REFUSING
+// IT MEANS REFUSING TO CONNECT.  It is weak — the stored verifier is
+// SHA1(SHA1(password)), a password-equivalent — and it is what a MariaDB
+// server and every MySQL 5.7 still offer.  It is implemented, it is
+// labelled here, and `is_weak_plugin` is the predicate a caller can
+// refuse on.
+//
+// THE EMPTY PASSWORD IS A SPECIAL CASE IN THE WIRE FORMAT.  A client
+// with no password sends a ZERO-LENGTH response rather than a scramble
+// of the empty string, under both plugins.  A client that scrambled ""
+// sends 20 bytes the server rejects, and the error says "access
+// denied", which sends everybody looking at the password.
+
+use mypacket
+
+// Which authentication plugin the server named.
+//
+// Two are implemented and the rest are named so a refusal can say which
+// — a server configured for `sha256_password` or an LDAP plugin is not
+// a broken server, it is one this client cannot talk to.
+pub enum MyAuthPlugin
+    // The default since MySQL 8.0: SHA-256 with a cache, a fast path
+    // and a full-authentication fallback.
+    MyCachingSha2
+    // SHA-1.  MariaDB's default and MySQL 5.7's; weak, supported, and
+    // labelled.
+    MyNativePassword
+    // The server named a plugin this client does not implement.
+    MyUnsupportedPlugin(name: Str)
+
+// What the server said when it answered the connection.
+//
+// Read straight off the wire, before anything is sent.
+pub struct MyHandshake
+    protocol_version: Int
+    // The server's version string, as a range into the caller's bytes.
+    server_version_at: Int
+    server_version_len: Int
+    connection_id: Int
+    // The 20-byte nonce, in the two pieces the packet splits it into
+    // and already joined.  Split in the format for historical reasons
+    // and a client that used only the first 8 bytes authenticates
+    // against nothing.
+    scramble: Bytes
+    capabilities: MyCapabilities
+    character_set: Int
+    status_flags: Int
+    plugin: MyAuthPlugin
+
+// What the client sends back.
+pub struct MyHandshakeResponse
+    capabilities: MyCapabilities
+    max_packet_bytes: Int
+    character_set: Int
+    username: Str
+    auth_response: Bytes
+    database: Str
+    plugin_name: Str
+
+// What `caching_sha2_password` asked for after the fast path missed.
+//
+// Returned rather than acted on, because the two branches have
+// different security properties and the choice is the caller's
+// connection policy rather than this module's.
+pub enum MyFullAuth
+    // The fast path worked: the server recognised the scramble from its
+    // cache and the exchange is over.  Nothing more to send.
+    MyAuthOk
+    // The server wants the password where it can read it.  Over TLS
+    // that is a cleartext send and is fine; over a plain socket it is
+    // not, and `myconn` refuses unless the caller said otherwise.
+    MyFullAuthRequired
+    // The server sent its RSA public key, for a client on a plain
+    // socket that asked for it.  Fetching this key over the SAME
+    // unencrypted socket authenticates nothing — an attacker in the
+    // middle substitutes their own — so a caller that uses it must have
+    // pinned the key out of band.
+    MyPublicKey(der: Bytes)
+
+// Why authentication did not happen.
+pub enum MyAuthFault
+    // The server named a plugin this client does not implement.
+    MyUnknownAuthPlugin(name: Str)
+    // The scramble was not 20 bytes.
+    MyBadScrambleLength(found: Int)
+    // The server asked for full authentication on an unencrypted
+    // socket and the caller did not allow it.  A refusal, not a
+    // failure: the alternative is sending the password in the clear.
+    MyCleartextRefused
+    // The server sent an RSA key on an unencrypted socket and the
+    // caller had not pinned one.  Refused for the same reason.
+    MyUnpinnedPublicKey
+    // The handshake packet is not one.
+    MyBadHandshake(at: Int)
+    // The server said no.
+    MyAccessDenied(code: Int, message: Str)
+
+// The standard `Error` implementation.
+impl Error for MyAuthFault
+    // One line: which stage of the handshake, and what the server said.
+    fn message(self) -> Str
+        todo("mysql-nv.myauth.MyAuthFault.message")
+
+// Read the server's greeting.
+//
+// ```novo
+// use myauth
+//
+// fn greeting(payload: Bytes) -> Result<MyHandshake, MyAuthFault>
+//     myauth.read_handshake(payload)
+//
+// fn main() [io]
+//     println("what the server said first")
+// ```
+pub fn read_handshake(payload: Bytes) -> Result<MyHandshake, MyAuthFault> []
+    todo("mysql-nv.myauth.read_handshake")
+
+// The plugin a name selects.
+//
+// ```novo
+// use myauth
+//
+// fn which(name: Str) -> MyAuthPlugin
+//     myauth.plugin_of_name(name)
+//
+// fn main() [io]
+//     println("which authentication plugin a server named")
+// ```
+pub fn plugin_of_name(name: Str) -> MyAuthPlugin []
+    todo("mysql-nv.myauth.plugin_of_name")
+
+// The name a plugin is sent as.
+//
+// ```novo
+// use myauth
+//
+// fn main() [io]
+//     println(myauth.plugin_name(MyCachingSha2))
+// ```
+pub fn plugin_name(p: MyAuthPlugin) -> Str []
+    todo("mysql-nv.myauth.plugin_name")
+
+// Is this plugin one whose stored verifier is password-equivalent?
+//
+// `mysql_native_password` is: the server stores SHA1(SHA1(password)),
+// and anybody who reads the table can authenticate as that user without
+// ever knowing the password.  Published so a caller with a policy can
+// refuse, rather than discovering the fact in a blog post.
+//
+// ```novo
+// use myauth
+//
+// fn main() [io]
+//     println("${myauth.is_weak_plugin(MyNativePassword)}")
+// ```
+pub fn is_weak_plugin(p: MyAuthPlugin) -> Bool []
+    todo("mysql-nv.myauth.is_weak_plugin")
+
+// The `mysql_native_password` response.
+//
+// `SHA1(password) XOR SHA1(scramble + SHA1(SHA1(password)))`, and an
+// EMPTY buffer when the password is empty — which is the wire format's
+// own special case and not an optimisation.  A client that scrambled
+// the empty string sends 20 bytes the server rejects with "access
+// denied", which sends everybody looking at the password.
+//
+// ```novo
+// use myauth
+//
+// fn answer(password: Str, scramble: Bytes) -> Bytes
+//     myauth.native_response(password, scramble)
+//
+// fn main() [io]
+//     println("the twenty bytes a login sends")
+// ```
+pub fn native_response(password: Str, scramble: Bytes) -> Bytes []
+    todo("mysql-nv.myauth.native_response")
+
+// The `caching_sha2_password` fast-path response.
+//
+// `SHA256(password) XOR SHA256(SHA256(SHA256(password)) + scramble)`,
+// and an empty buffer for an empty password.  Safe on a plain socket:
+// it proves knowledge of the password without carrying it, and the
+// server can check it against its cache.
+//
+// ```novo
+// use myauth
+//
+// fn answer(password: Str, scramble: Bytes) -> Bytes
+//     myauth.caching_sha2_response(password, scramble)
+//
+// fn main() [io]
+//     println("the fast-path login answer")
+// ```
+pub fn caching_sha2_response(password: Str, scramble: Bytes) -> Bytes []
+    todo("mysql-nv.myauth.caching_sha2_response")
+
+// What the server's follow-up packet is asking for.
+//
+// The decision point: `MyAuthOk` ends the exchange, and anything else
+// means the password has to go where the server can read it.
+//
+// ```novo
+// use myauth
+//
+// fn next_step(payload: Bytes) -> Result<MyFullAuth, MyAuthFault>
+//     myauth.read_auth_more_data(payload)
+//
+// fn main() [io]
+//     println("whether the fast path worked")
+// ```
+pub fn read_auth_more_data(payload: Bytes) -> Result<MyFullAuth, MyAuthFault> []
+    todo("mysql-nv.myauth.read_auth_more_data")
+
+// The request for the server's RSA public key.
+//
+// One byte.  Sending it over an unencrypted socket and trusting the
+// answer authenticates nothing — see `MyPublicKey`.
+//
+// ```novo
+// use myauth
+//
+// fn ask() -> Bytes
+//     myauth.request_public_key()
+//
+// fn main() [io]
+//     println("the one byte that asks for a key")
+// ```
+pub fn request_public_key() -> Bytes []
+    todo("mysql-nv.myauth.request_public_key")
+
+// The password, RSA-encrypted under the server's public key.
+//
+// The password is XORed with the scramble first and NUL-terminated,
+// then encrypted with OAEP — so the same password produces different
+// bytes on every connection, which is what stops a replay.  The key is
+// the caller's argument, because the only safe key is one the caller
+// pinned.
+//
+// ```novo
+// use myauth
+//
+// fn sealed(password: Str, scramble: Bytes, key: Bytes) -> Result<Bytes, MyAuthFault>
+//     myauth.encrypt_password(password, scramble, key)
+//
+// fn main() [io]
+//     println("a password the path cannot read")
+// ```
+pub fn encrypt_password(password: Str, scramble: Bytes,
+                        public_key_der: Bytes) -> Result<Bytes, MyAuthFault> []
+    todo("mysql-nv.myauth.encrypt_password")
+
+// The cleartext password, NUL-terminated, for a TLS connection.
+//
+// Correct over TLS and a disaster without it, which is why `myconn`
+// gates it and why this function's name says what it is.
+//
+// ```novo
+// use myauth
+//
+// fn over_tls(password: Str) -> Bytes
+//     myauth.cleartext_password(password)
+//
+// fn main() [io]
+//     println("the password, for a channel that is already encrypted")
+// ```
+pub fn cleartext_password(password: Str) -> Bytes []
+    todo("mysql-nv.myauth.cleartext_password")
+
+// Build the handshake response.
+//
+// ```novo
+// use myauth
+// use mypacket
+//
+// fn reply(h: MyHandshake, answer: Bytes) -> MyHandshakeResponse
+//     myauth.response(h, "app", answer, "appdb", mypacket.default_capabilities())
+//
+// fn main() [io]
+//     println("what the client sends back")
+// ```
+pub fn response(h: MyHandshake, username: Str, auth_response: Bytes, database: Str,
+                want: MyCapabilities) -> MyHandshakeResponse []
+    todo("mysql-nv.myauth.response")
+
+// The handshake response's bytes.
+//
+// ```novo
+// use myauth
+//
+// fn wire(r: MyHandshakeResponse) -> Bytes
+//     myauth.write_response(r)
+//
+// fn main() [io]
+//     println("the login packet, on the wire")
+// ```
+pub fn write_response(r: MyHandshakeResponse) -> Bytes []
+    todo("mysql-nv.myauth.write_response")
+
+// The short packet that precedes a TLS handshake.
+//
+// The capabilities with `CLIENT_SSL` set and nothing after them: the
+// server reads it, starts TLS, and the real handshake response follows
+// inside the encrypted channel.  A client that sent the username here
+// has sent it in the clear.
+//
+// ```novo
+// use myauth
+// use mypacket
+//
+// fn before_tls(c: MyCapabilities) -> Bytes
+//     myauth.write_ssl_request(c, 33)
+//
+// fn main() [io]
+//     println("the packet that says the next bytes are TLS")
+// ```
+pub fn write_ssl_request(c: MyCapabilities, character_set: Int) -> Bytes []
+    todo("mysql-nv.myauth.write_ssl_request")

@@ -1,0 +1,139 @@
+// auth_tests.nv — logging in, and the branch where the password can
+// leave the machine in the clear.
+//
+// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
+// assertion here reaches `not implemented: mysql-nv.myauth.<fn>`.
+//
+// WHY THESE ASSERTIONS AND NOT A VECTOR TABLE.  The scrambles are
+// keyed hashes of a server-supplied nonce, and MySQL publishes no
+// worked example the way RFC 7677 does for SCRAM — so the
+// implementation lane's oracle is a captured handshake against a real
+// server, and what can be asserted with no server is the SHAPE: the
+// twenty-byte nonce, the empty response for an empty password, and
+// which branch of `caching_sha2_password` is the one that carries the
+// password.
+
+use std.test
+use std.bytes
+use myauth
+
+// The twenty bytes a server's greeting carries.  Any twenty will do
+// here: what is being asserted is the width and the empty-password
+// rule, not the hash.
+fn a_scramble() -> Bytes
+    bytes.zeros(20)
+
+@test
+fn test_the_two_plugins_are_named_and_one_of_them_is_labelled_weak() [io]
+    test.case("the default since MySQL 8")
+    test.assert_eq_str(myauth.plugin_name(MyCachingSha2), "caching_sha2_password")
+
+    test.case("and the one MariaDB and MySQL 5.7 still send")
+    test.assert_eq_str(myauth.plugin_name(MyNativePassword), "mysql_native_password")
+
+    test.case("a name reads back to its plugin")
+    test.assert_eq_str(myauth.plugin_name(myauth.plugin_of_name("caching_sha2_password")),
+                       "caching_sha2_password")
+
+    test.case("the SHA-1 one is weak, and the stored verifier is password-equivalent")
+    test.assert(myauth.is_weak_plugin(MyNativePassword))
+
+    test.case("the SHA-256 one is not")
+    test.assert(myauth.is_weak_plugin(MyCachingSha2) == false)
+
+    test.case("and a plugin this client cannot speak is named rather than guessed at")
+    test.assert(myauth.is_weak_plugin(myauth.plugin_of_name("authentication_ldap_sasl")) == false)
+
+@test
+fn test_an_empty_password_sends_nothing_and_not_a_scramble_of_nothing() [io]
+    // The wire format's own special case.  A client that scrambled ""
+    // sends twenty bytes the server rejects, and the error says "access
+    // denied", which sends everybody looking at the password.
+    test.case("native, with no password")
+    test.assert_eq(bytes.len(myauth.native_response("", a_scramble())), 0)
+
+    test.case("caching sha2, with no password")
+    test.assert_eq(bytes.len(myauth.caching_sha2_response("", a_scramble())), 0)
+
+    test.case("and a real password produces the hash's width")
+    test.assert_eq(bytes.len(myauth.native_response("secret", a_scramble())), 20)
+    test.assert_eq(bytes.len(myauth.caching_sha2_response("secret", a_scramble())), 32)
+
+@test
+fn test_a_scramble_that_is_not_twenty_bytes_is_a_fault_and_not_a_login() [io]
+    test.case("a greeting whose nonce is short is refused")
+    match myauth.read_handshake(bytes.zeros(8))
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+    test.case("and so is one that is not a greeting at all")
+    match myauth.read_handshake(bytes.zeros(0))
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+@test
+fn test_the_fast_path_and_the_slow_path_are_different_answers() [io]
+    // THE ASSERTION THIS FILE EXISTS FOR.  The fast path proves
+    // knowledge of the password without carrying it and is safe on a
+    // plain socket.  The slow path needs the password where the server
+    // can read it — over TLS, or RSA-encrypted under a key the caller
+    // pinned — and a client that answered it by sending the password
+    // over an unencrypted socket has handed it to the path.
+    test.case("the server says the cache hit")
+    match myauth.read_auth_more_data(bytes.from_byte_list([1, 3]))
+        Err(_) => test.assert(true)
+        Ok(a)  =>
+            match a
+                MyAuthOk           => test.assert(true)
+                MyFullAuthRequired => test.assert(false)
+                MyPublicKey(der)   => test.assert(false)
+
+    test.case("the server asks for full authentication")
+    match myauth.read_auth_more_data(bytes.from_byte_list([1, 4]))
+        Err(_) => test.assert(true)
+        Ok(a)  =>
+            match a
+                MyFullAuthRequired => test.assert(true)
+                MyAuthOk           => test.assert(false)
+                MyPublicKey(der)   => test.assert(false)
+
+    test.case("and asking for the key is one byte")
+    test.assert_eq(bytes.len(myauth.request_public_key()), 1)
+
+@test
+fn test_the_cleartext_password_is_nul_terminated_and_says_what_it_is() [io]
+    // Correct over TLS and a disaster without it, which is why the
+    // function's name says what it is and why `myconn` gates it.
+    test.case("the password and a terminator")
+    test.assert_eq(bytes.len(myauth.cleartext_password("secret")), 7)
+
+    test.case("and an empty password is still terminated")
+    test.assert_eq(bytes.len(myauth.cleartext_password("")), 1)
+
+@test
+fn test_an_rsa_sealed_password_is_different_every_connection() [io]
+    // The password is XORed with the scramble before it is encrypted,
+    // so the same password under the same key produces different bytes
+    // on every connection — which is what stops a replay.
+    test.case("an empty key is not a key")
+    match myauth.encrypt_password("secret", a_scramble(), bytes.zeros(0))
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+@test
+fn test_the_login_packet_and_the_tls_request_are_two_different_packets() [io]
+    // A client that sent its username in the TLS request has sent it in
+    // the clear: the SSL request carries the capability flags and
+    // nothing else, and the real handshake response follows inside the
+    // encrypted channel.
+    match myauth.read_handshake(bytes.zeros(64))
+        Err(_) => test.assert(true)
+        Ok(h)  =>
+            let r = myauth.response(h, "app", myauth.native_response("secret", h.scramble),
+                                    "appdb", h.capabilities)
+            test.case("the login packet names the user")
+            test.assert_eq_str(r.username, "app")
+
+            test.case("and it is longer than the TLS request, which names nobody")
+            test.assert(bytes.len(myauth.write_response(r))
+                        > bytes.len(myauth.write_ssl_request(h.capabilities, 255)))

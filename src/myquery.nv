@@ -1,0 +1,389 @@
+// myquery.nv — asking, in the two protocols, and the packet a client
+// may refuse.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// A PARAMETER GOES AS A PARAMETER.  `query` takes a statement and a
+// list of values and never builds a string, which is what makes SQL
+// injection structurally impossible rather than a matter of escaping.
+// MySQL's text protocol has no parameters at all, so a parameterised
+// query is a PREPARED one — `prepare`, `execute`, and either keep the
+// statement or close it — and this module's `query` does that round trip
+// for a caller that does not want to hold one.
+//
+// THE RESULT SET'S SHAPE DEPENDS ON THE CAPABILITIES, WHICH IS WHY
+// EVERY DECODE TAKES THE CONNECTION.  Column count, column
+// definitions, maybe an EOF, rows, maybe another EOF — except that with
+// `CLIENT_DEPRECATE_EOF` both terminators are OK packets instead, and
+// the row phase ends on a byte that is also a legal first byte of a
+// row.  A reader that hard-coded either shape works against one server
+// and hangs against the other.
+//
+// MULTIPLE RESULT SETS ARE THE DEFAULT HAZARD.  A stored procedure, or
+// a statement sent with `CLIENT_MULTI_STATEMENTS`, answers several
+// result sets in a row, and the OK packet's `SERVER_MORE_RESULTS_EXISTS`
+// flag is the only thing that says so.  A client that ignored it leaves
+// unread packets on the socket and the NEXT query reads the previous
+// statement's rows — which looks like data corruption and is a framing
+// bug.  `next_result` is the call, and `MyResultSet.more_results` is the
+// flag a caller has to look at.
+//
+// `LOAD DATA LOCAL INFILE` IS THE SERVER ASKING THE CLIENT FOR A FILE,
+// AND THIS PACKAGE NEVER READS ONE.  The request arrives mid-exchange
+// as a `0xFB` packet carrying a path, and a client that honoured it
+// blindly hands any readable file to whatever it is connected to.  So
+// `MyLocalInfileRequest` comes back to the CALLER as a value, the
+// caller decides and supplies the bytes, and the `[fs]` that reading a
+// file costs is spent in the caller's program and never in this
+// package.  That is what keeps every row here `[net]` and `[time]`.
+
+// What a statement answered.
+pub enum MyOutcome
+    // No rows: an `INSERT`, an `UPDATE`, a `CREATE TABLE`.
+    MyAffected(ok: MyOk)
+    // Rows.
+    MyRows(result: MyResultSet)
+    // The server is asking for a local file before it can go on.  A
+    // value, not an action: see the module header.
+    MyLocalFileWanted(path: Str)
+
+// One result set.
+pub struct MyResultSet
+    columns: [MyColumn]
+    rows: [[MyValue]]
+    // The buffer the columns' name ranges point into.  Travels with
+    // them, because a column without it is offsets into nothing.
+    buffer: Bytes
+    // The OK or EOF packet that ended it: warnings, status flags, and
+    // whether another result set follows.
+    ok: MyOk
+    // `SERVER_MORE_RESULTS_EXISTS`.  A caller that ignores it leaves
+    // packets on the socket.
+    more_results: Bool
+
+// A prepared statement.
+pub struct MyStatement
+    id: Int
+    // How many `?` placeholders it has.  A caller that bound a
+    // different number gets an error from the server rather than a
+    // wrong answer, which is the good case; the field is here so a
+    // caller can check first.
+    parameter_count: Int
+    // The columns it will answer, when the server sent them at prepare
+    // time.  Empty for a statement that returns none.
+    columns: [MyColumn]
+    buffer: Bytes
+
+// Send a statement with no parameters, in the text protocol.
+//
+// `COM_QUERY`.  The right call for DDL and for a statement whose text
+// is entirely the program's own; anything carrying a value from outside
+// goes through `query`.
+//
+// ```novo
+// use myquery
+// use myconn
+//
+// fn ddl(c: MyConn) -> Result<MyQueryResult, MyFault> [net, time]
+//     myquery.exec(c, "CREATE TABLE t (n INT)")
+//
+// fn main() [io]
+//     println("a statement with nothing in it from outside")
+// ```
+pub fn exec(c: MyConn, sql: Str) -> Result<MyQueryResult, MyFault> [net, time]
+    todo("mysql-nv.myquery.exec")
+
+// What a call answered, and the connection to carry on with.
+pub struct MyQueryResult
+    conn: MyConn
+    outcome: MyOutcome
+
+// Ask a parameterised question, in one call.
+//
+// Prepares, executes in the binary protocol, reads the answer and
+// closes the statement.  The values go as PARAMETERS and never into the
+// string.
+//
+// ```novo
+// use myquery
+// use myconn
+// use mytype
+//
+// fn recent(c: MyConn, id: Int) -> Result<MyQueryResult, MyFault> [net, time]
+//     myquery.query(c, "SELECT name FROM t WHERE id > ?", [MyInt(v: id)])
+//
+// fn main() [io]
+//     println("rows, with nothing interpolated")
+// ```
+pub fn query(c: MyConn, sql: Str,
+             parameters: [MyValue]) -> Result<MyQueryResult, MyFault> [net, time]
+    todo("mysql-nv.myquery.query")
+
+// Prepare a statement and keep it.
+//
+// For a statement run many times: the server parses once, and each
+// execution sends only the parameters.
+//
+// ```novo
+// use myquery
+// use myconn
+//
+// fn ready(c: MyConn) -> Result<MyPrepared, MyFault> [net, time]
+//     myquery.prepare(c, "INSERT INTO t (n) VALUES (?)")
+//
+// fn main() [io]
+//     println("a statement the server has already parsed")
+// ```
+pub fn prepare(c: MyConn, sql: Str) -> Result<MyPrepared, MyFault> [net, time]
+    todo("mysql-nv.myquery.prepare")
+
+// A prepared statement, and the connection it belongs to.
+//
+// The two together, because a statement id is only meaningful on the
+// connection that prepared it — and a caller holding one against
+// another connection gets "unknown prepared statement handler", which
+// reads like a bug in the statement.
+pub struct MyPrepared
+    conn: MyConn
+    statement: MyStatement
+
+// Run a prepared statement.
+//
+// ```novo
+// use myquery
+// use mytype
+//
+// fn run(p: MyPrepared) -> Result<MyQueryResult, MyFault> [net, time]
+//     myquery.execute(p, [MyInt(v: 42)])
+//
+// fn main() [io]
+//     println("a statement, run again")
+// ```
+pub fn execute(p: MyPrepared, parameters: [MyValue]) -> Result<MyQueryResult, MyFault> [net, time]
+    todo("mysql-nv.myquery.execute")
+
+// Tell the server it can forget a statement.
+//
+// `COM_STMT_CLOSE`.  A connection that prepared ten thousand statements
+// and closed none of them is a connection the server has spent memory
+// on, and `max_prepared_stmt_count` eventually refuses the next one —
+// with an error about the statement rather than about the leak.
+//
+// ```novo
+// use myquery
+//
+// fn done(p: MyPrepared) -> Result<MyConn, MyFault> [net, time]
+//     myquery.close_statement(p)
+//
+// fn main() [io]
+//     println("a statement, released")
+// ```
+pub fn close_statement(p: MyPrepared) -> Result<MyConn, MyFault> [net, time]
+    todo("mysql-nv.myquery.close_statement")
+
+// Reset a prepared statement's bound state.
+//
+// `COM_STMT_RESET`: drops the long-data a previous `send_long_data`
+// accumulated and clears the parameter bindings, without re-parsing.
+// The call a caller needs after an execution failed part-way.
+//
+// ```novo
+// use myquery
+//
+// fn clean(p: MyPrepared) -> Result<MyPrepared, MyFault> [net, time]
+//     myquery.reset_statement(p)
+//
+// fn main() [io]
+//     println("a statement, back to unbound")
+// ```
+pub fn reset_statement(p: MyPrepared) -> Result<MyPrepared, MyFault> [net, time]
+    todo("mysql-nv.myquery.reset_statement")
+
+// Send one parameter's value in pieces, before executing.
+//
+// `COM_STMT_SEND_LONG_DATA`, and the only way to write a value larger
+// than one packet without holding it all in memory: the pieces
+// accumulate on the server and the execution sends nothing for that
+// parameter.  There is no acknowledgement — the server answers nothing
+// at all — so a failure shows up at the execution rather than here,
+// which is the one genuinely awkward corner of the binary protocol and
+// is named rather than hidden.
+//
+// ```novo
+// use myquery
+//
+// fn piece(p: MyPrepared, b: Bytes) -> Result<MyPrepared, MyFault> [net, time]
+//     myquery.send_long_data(p, 0, b)
+//
+// fn main() [io]
+//     println("part of a large value")
+// ```
+pub fn send_long_data(p: MyPrepared, parameter: Int,
+                      chunk: Bytes) -> Result<MyPrepared, MyFault> [net, time]
+    todo("mysql-nv.myquery.send_long_data")
+
+// Read the next result set, when the last one said another follows.
+//
+// A caller that never calls this leaves unread packets on the socket,
+// and the next query reads the previous statement's rows.
+//
+// ```novo
+// use myquery
+// use myconn
+//
+// fn again(c: MyConn) -> Result<MyQueryResult, MyFault> [net, time]
+//     myquery.next_result(c)
+//
+// fn main() [io]
+//     println("the result set behind this one")
+// ```
+pub fn next_result(c: MyConn) -> Result<MyQueryResult, MyFault> [net, time]
+    todo("mysql-nv.myquery.next_result")
+
+// Supply the file the server asked for.
+//
+// The answer to `MyLocalFileWanted`.  This package never opens a file:
+// the caller has already decided that the path is one it is willing to
+// send and has read the bytes itself, which is what keeps the `[fs]`
+// out of here and the decision where a person can see it.
+//
+// An empty buffer is the refusal, and it is a legal answer the server
+// understands — the statement then fails with an error rather than the
+// connection breaking.
+//
+// ```novo
+// use myquery
+// use myconn
+//
+// fn supply(c: MyConn, contents: Bytes) -> Result<MyQueryResult, MyFault> [net, time]
+//     myquery.send_local_file(c, contents)
+//
+// fn main() [io]
+//     println("a file the caller chose to send")
+// ```
+pub fn send_local_file(c: MyConn, contents: Bytes) -> Result<MyQueryResult, MyFault> [net, time]
+    todo("mysql-nv.myquery.send_local_file")
+
+// Refuse the file the server asked for.
+//
+// The same as sending nothing, said as itself so a caller's refusal
+// path is a call rather than an empty buffer somebody later "fixes".
+//
+// ```novo
+// use myquery
+// use myconn
+//
+// fn refuse(c: MyConn) -> Result<MyQueryResult, MyFault> [net, time]
+//     myquery.refuse_local_file(c)
+//
+// fn main() [io]
+//     println("a file the caller would not send")
+// ```
+pub fn refuse_local_file(c: MyConn) -> Result<MyQueryResult, MyFault> [net, time]
+    todo("mysql-nv.myquery.refuse_local_file")
+
+// Is this path inside the directory the options allow?
+//
+// The check `MyLocalInfileUnder` describes: resolve `..` and symbolic
+// links first, then compare.  Published because a caller that wrote the
+// comparison itself writes it on the unresolved string, and
+// `/data/../etc/passwd` passes that test.
+//
+// ```novo
+// use myquery
+//
+// fn allowed(directory: Str, path: Str) -> Bool
+//     myquery.local_path_allowed(directory, path)
+//
+// fn main() [io]
+//     println("whether a requested path is inside the allowed directory")
+// ```
+pub fn local_path_allowed(directory: Str, path: Str) -> Bool []
+    todo("mysql-nv.myquery.local_path_allowed")
+
+// How many rows a result set holds.
+//
+// ```novo
+// use myquery
+//
+// fn many(r: MyResultSet) -> Int
+//     myquery.row_count(r)
+//
+// fn main() [io]
+//     println("how many rows came back")
+// ```
+pub fn row_count(r: MyResultSet) -> Int []
+    todo("mysql-nv.myquery.row_count")
+
+// One value, by row and column.
+//
+// `None` past the end rather than a panic, because a caller reading a
+// result set it did not shape — a console, a migration tool — meets a
+// missing column as an ordinary answer.
+//
+// ```novo
+// use myquery
+//
+// fn cell(r: MyResultSet) -> Bool
+//     match myquery.value_at(r, 0, 0)
+//         Some(v) => true
+//         None    => false
+//
+// fn main() [io]
+//     println("one cell out of a result set")
+// ```
+pub fn value_at(r: MyResultSet, row: Int, column: Int) -> ?MyValue []
+    todo("mysql-nv.myquery.value_at")
+
+// One value, by row and column NAME.
+//
+// ```novo
+// use myquery
+//
+// fn cell(r: MyResultSet) -> Bool
+//     match myquery.value_named(r, 0, "name")
+//         Some(v) => true
+//         None    => false
+//
+// fn main() [io]
+//     println("one named cell")
+// ```
+pub fn value_named(r: MyResultSet, row: Int, column: Str) -> ?MyValue []
+    todo("mysql-nv.myquery.value_named")
+
+// The id an `INSERT` generated.
+//
+// Zero when the statement generated none, which is not an error — an
+// `UPDATE` and a table with no auto-increment column both answer zero.
+//
+// ```novo
+// use myquery
+//
+// fn generated(o: MyOutcome) -> Int
+//     myquery.last_insert_id(o)
+//
+// fn main() [io]
+//     println("the id an insert made")
+// ```
+pub fn last_insert_id(o: MyOutcome) -> Int []
+    todo("mysql-nv.myquery.last_insert_id")
+
+// How many rows a statement changed.
+//
+// MySQL's own definition: rows CHANGED, not rows matched, so an
+// `UPDATE` that set a column to the value it already had answers zero.
+// A caller checking "did my update apply" against this gets the wrong
+// answer, and `CLIENT_FOUND_ROWS` is the capability that changes it —
+// which is why the capability exists and why this comment does.
+//
+// ```novo
+// use myquery
+//
+// fn changed(o: MyOutcome) -> Int
+//     myquery.affected_rows(o)
+//
+// fn main() [io]
+//     println("how many rows changed")
+// ```
+pub fn affected_rows(o: MyOutcome) -> Int []
+    todo("mysql-nv.myquery.affected_rows")

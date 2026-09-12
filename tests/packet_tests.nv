@@ -1,0 +1,202 @@
+// packet_tests.nv — the framing, the sequence number, and the
+// capabilities that decide what the bytes mean.
+//
+// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
+// assertion here reaches `not implemented: mysql-nv.mypacket.<fn>`.
+// That is the expected result until the bodies land.
+//
+// WHERE THE CONSTANTS CAME FROM.  `0xFFFFFF` is the three-byte length
+// field's maximum and is in MySQL's own `protocol_basic.h`; the
+// capability bits are `CLIENT_PROTOCOL_41` (512),
+// `CLIENT_SSL` (2048), `CLIENT_LOCAL_FILES` (128),
+// `CLIENT_PLUGIN_AUTH` (1 << 19) and `CLIENT_DEPRECATE_EOF` (1 << 24),
+// which have not moved since they were assigned.  Asserting them is a
+// port check rather than a restatement of this package's code.
+
+use std.test
+use std.bytes
+use mypacket
+
+@test
+fn test_the_capability_bits_are_the_protocol_s_own() [io]
+    test.case("CLIENT_PROTOCOL_41")
+    test.assert_eq(mypacket.capability_protocol_41(), 512)
+
+    test.case("CLIENT_LOCAL_FILES")
+    test.assert_eq(mypacket.capability_local_files(), 128)
+
+    test.case("CLIENT_SSL")
+    test.assert_eq(mypacket.capability_ssl(), 2048)
+
+    test.case("CLIENT_PLUGIN_AUTH")
+    test.assert_eq(mypacket.capability_plugin_auth(), 524288)
+
+    test.case("CLIENT_DEPRECATE_EOF")
+    test.assert_eq(mypacket.capability_deprecate_eof(), 16777216)
+
+@test
+fn test_a_client_asks_for_local_files_only_if_it_means_to() [io]
+    // The complete defence against `LOAD DATA LOCAL INFILE` is not to
+    // negotiate the capability at all, so the server cannot ask.
+    test.case("the defaults do not include it")
+    test.assert(mypacket.has_capability(mypacket.default_capabilities(),
+                                        mypacket.capability_local_files()) == false)
+
+    test.case("the defaults do include plugin authentication, without which nothing logs in")
+    test.assert(mypacket.has_capability(mypacket.default_capabilities(),
+                                        mypacket.capability_plugin_auth()))
+
+    test.case("and a fresh client has agreed to nothing")
+    test.assert_eq(mypacket.no_capabilities().flags, 0)
+
+@test
+fn test_the_capabilities_in_force_are_the_intersection() [io]
+    // A client that kept its own request instead parses the server's
+    // answers with flags the server never agreed to.
+    test.case("what neither side offered is not in force")
+    let agreed = mypacket.negotiate(mypacket.default_capabilities(),
+                                    mypacket.no_capabilities())
+    test.assert_eq(agreed.flags, 0)
+
+    test.case("and what both offered is")
+    let both = mypacket.negotiate(mypacket.default_capabilities(),
+                                  mypacket.default_capabilities())
+    test.assert(mypacket.has_capability(both, mypacket.capability_protocol_41()))
+
+@test
+fn test_a_socket_read_is_not_a_packet() [io]
+    // A read returns whatever the kernel had, which is a packet and a
+    // half about as often as it is a packet.
+    test.case("an empty buffer holds no header")
+    match mypacket.frame_length(bytes.zeros(0), 0, 16777216)
+        Err(_) => test.assert(false)
+        Ok(n)  => test.assert_none(n)
+
+    test.case("and three bytes of a four-byte header do not either")
+    match mypacket.frame_length(bytes.zeros(3), 0, 16777216)
+        Err(_) => test.assert(false)
+        Ok(n)  => test.assert_none(n)
+
+    test.case("a length past the caller's ceiling is a refusal, not an allocation")
+    match mypacket.frame_length(bytes.from_byte_list([255, 255, 255, 0]), 0, 1024)
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+@test
+fn test_a_sixteen_megabyte_payload_is_split_and_the_last_piece_may_be_empty() [io]
+    // THE ASSERTION THIS FILE EXISTS FOR.  A payload of exactly
+    // `0xFFFFFF` is CONTINUED, and one that is an exact multiple is
+    // followed by a packet of length ZERO.  A reader that took the
+    // length at face value truncates a large row; one that stopped at
+    // the first short packet hangs on the terminator.
+    test.case("the three-byte length field's maximum")
+    test.assert_eq(mypacket.max_payload_bytes(), 16777215)
+
+    test.case("a full packet is continued")
+    match mypacket.read_packet(bytes.from_byte_list([255, 255, 255, 0]), 0,
+                               mypacket.command_seq(), 16777216)
+        Err(_) => test.assert(true)
+        Ok(p)  =>
+            match p
+                None    => test.assert(true)
+                Some(q) => test.assert(mypacket.is_continued(q))
+
+@test
+fn test_the_sequence_number_is_the_client_s_to_keep() [io]
+    // The server answers `Packets out of order` and closes, which is
+    // not a network problem and not a query problem, and is the single
+    // commonest symptom of a hand-written client.
+    test.case("a command starts at zero")
+    test.assert_eq(mypacket.command_seq().n, 0)
+
+    test.case("and increments")
+    test.assert_eq(mypacket.next_seq(mypacket.command_seq()).n, 1)
+
+    test.case("a packet whose sequence is not the one expected is caught here")
+    match mypacket.read_packet(bytes.from_byte_list([1, 0, 0, 9, 1]), 0,
+                               mypacket.command_seq(), 16777216)
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+@test
+fn test_a_command_is_framed_with_its_header_and_the_sequence_advances() [io]
+    let w = mypacket.write_packet(bytes.from_str("x"), mypacket.command_seq())
+
+    test.case("four bytes of header and one of payload")
+    test.assert_eq(bytes.len(w.bytes), 5)
+
+    test.case("and the next packet carries the next number")
+    test.assert_eq(w.seq.n, 1)
+
+@test
+fn test_the_length_encoded_integer_is_mysql_s_own_varint() [io]
+    // One byte below 251, then 0xFC plus two, 0xFD plus three, 0xFE
+    // plus eight.  0xFB is not a number at all: it is NULL in a text
+    // row, which is why the decoder answers a flag rather than zero.
+    test.case("a small number is one byte")
+    match mypacket.read_length_encoded(bytes.from_byte_list([7]), 0)
+        None    => test.assert(false)
+        Some(v) =>
+            test.assert_eq(v.value, 7)
+            test.assert_eq(v.next_at, 1)
+            test.assert(v.is_null == false)
+
+    test.case("0xFB is NULL and not zero")
+    match mypacket.read_length_encoded(bytes.from_byte_list([251]), 0)
+        None    => test.assert(false)
+        Some(v) => test.assert(v.is_null)
+
+    test.case("and a number round-trips through the writer")
+    match mypacket.read_length_encoded(mypacket.write_length_encoded(70000), 0)
+        None    => test.assert(false)
+        Some(v) => test.assert_eq(v.value, 70000)
+
+    test.case("a length-encoded string carries its own length")
+    match mypacket.read_length_encoded_string(bytes.from_byte_list([2, 104, 105]), 0)
+        None    => test.assert(false)
+        Some(s) =>
+            test.assert_eq(s.len, 2)
+            test.assert_eq(s.next_at, 3)
+
+@test
+fn test_the_same_byte_is_a_different_message_under_different_flags() [io]
+    // With `CLIENT_DEPRECATE_EOF` the server sends an OK packet where
+    // it used to send an EOF, and `0xFE` is also the prefix of an
+    // 8-byte length-encoded integer and a legal first byte of row data.
+    // A parser that branched on the byte alone misreads any row
+    // beginning with it.
+    let payload = bytes.from_byte_list([254, 0, 0, 2, 0])
+    let p = MyPacket { seq: 1, payload_at: 0, payload_len: 5 }
+
+    test.case("without the flag, a short 0xFE packet ends a result set")
+    test.assert(mypacket.looks_like_eof(payload, p, mypacket.no_capabilities()))
+
+    test.case("with it, the same bytes are not a terminator")
+    test.assert(mypacket.looks_like_eof(payload, p, mypacket.default_capabilities()) == false)
+
+    test.case("and the kind depends on the same three things")
+    match mypacket.kind_of(payload, p, mypacket.no_capabilities())
+        MyEofPacket          => test.assert(true)
+        MyOkPacket           => test.assert(false)
+        MyErrPacket          => test.assert(false)
+        MyLocalInfileRequest => test.assert(false)
+        MyAuthMoreData       => test.assert(false)
+        MyPayload            => test.assert(false)
+
+@test
+fn test_the_transaction_status_rides_the_ok_packet_and_nothing_else() [io]
+    // PostgreSQL has `ReadyForQuery`; MySQL has these flags and no
+    // other carrier.  A caller that acted without asking acted inside a
+    // transaction the server may have rolled back under it.
+    let payload = bytes.from_byte_list([0, 0, 0, 3, 0, 0, 0])
+    let p = MyPacket { seq: 1, payload_at: 0, payload_len: 7 }
+
+    test.case("an OK packet reads back")
+    match mypacket.read_ok(payload, p, mypacket.default_capabilities())
+        Err(_) => test.assert(true)
+        Ok(o)  =>
+            test.case("and says whether a transaction is open")
+            test.assert(mypacket.in_transaction(o))
+
+            test.case("and whether another result set is waiting")
+            test.assert(mypacket.more_results(o) == false)

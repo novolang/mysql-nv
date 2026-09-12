@@ -1,0 +1,191 @@
+// mydriver.nv — the `std.sql` driver: a `Database` a program can hold
+// without naming an engine, over the MySQL wire.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// THE SAME CONTRACT sqlite-nv AND postgres-nv IMPLEMENT.  A program
+// written against `dyn Database` runs over any of the three, with
+// nothing in it naming any of them:
+//
+//   fn migrate(db: dyn Database) -> Str [io, fs, net]
+//       match db.exec("CREATE TABLE t (n INTEGER)")
+//
+// THE EFFECT ROW ON THIS IMPL IS `[net, time]`, AND THE TRAIT SAYS
+// `[io]`.  That is legal — a trait with no effect parameter does not
+// pin its impls' rows — and it is worth writing down what it costs,
+// because the cost is somebody else's.  A `dyn Database` call is
+// charged the UNION over every impl in the program (SPEC § 5.6), so a
+// program that links this package makes EVERY `dyn Database` call in it
+// cost `[net, time]`, including the ones that only ever hold a SQLite
+// file.  A concrete receiver is charged its own row, so the union is
+// only paid where the engine really is unknown.
+//
+// This is the same obstruction postgres-nv's `pgdriver` records, and it
+// has the same fix: an effect parameter on the trait, so each impl
+// supplies what it costs.  It is a CONTRACT change and belongs in a
+// feature file; this package names it rather than working around it,
+// and it is the widening this row found.
+//
+// THE CONTRACT IS NARROW AND THE ROWS ARE ELSEWHERE.  `Database` has no
+// Rows/Row surface, so `close`, `exec` and `query_count` are what
+// crosses the engine boundary and `myquery`'s functions are what
+// returns rows.  A caller that wants rows has chosen MySQL by then,
+// which is the trade the contract makes on purpose.
+
+use myconn
+use myerror
+use mypool
+
+// A MySQL database, as a `Database`.
+//
+// Named `MyDatabase` and not `MySql` or `Database`: struct identity is
+// keyed by NAME across a whole assembly (E2004), and a package that
+// names a common noun takes it from every consumer.
+pub struct MyDatabase
+    conn: MyConn
+    // The fault behind the last `DbError`, which the contract has no
+    // room for.  See `last_fault`.
+    last: ?MyFault
+
+// The prelude `Database` contract, over the MySQL wire.
+//
+// ```novo
+// use mydriver
+// use myconn
+//
+// fn main() [io, net, time]
+//     match mydriver.open(myconn.default_options("app"), myconn.plain_transport())
+//         Err(_) => println("no")
+//         Ok(db) =>
+//             match db.exec("CREATE TABLE t (n INTEGER)")
+//                 Some(e) => println("failed")
+//                 None    => println("ok")
+// ```
+impl Database for MyDatabase
+    // `COM_QUIT`, then close the socket.
+    fn close(self) [net, time]
+        todo("mysql-nv.mydriver.close")
+
+    // Run a statement that returns no rows.
+    //
+    // `None` is success.  The SQLSTATE decides the `DbError` variant
+    // where there is one and the error NUMBER decides it otherwise —
+    // because MySQL sends the SQLSTATE only under
+    // `CLIENT_PROTOCOL_41`, and a mapping that assumed it would put
+    // every error from an old server into `DbOther`.  The full detail
+    // is not lost: `last_fault` answers the error number, the SQLSTATE
+    // and the server's message.
+    fn exec(self, sql: Str) -> ?DbError [net, time]
+        todo("mysql-nv.mydriver.exec")
+
+    // How many rows `sql` produces.
+    //
+    // Runs the statement and counts.  There is no plan-time estimate
+    // here and `EXPLAIN`'s row estimate would be one — inventing it
+    // would make a caller think it had asked a cheap question and had
+    // got a true answer, and it would be neither.
+    fn query_count(self, sql: Str) -> Result<Int, DbError> [net, time]
+        todo("mysql-nv.mydriver.query_count")
+
+// Open a database over a fresh connection.
+//
+// ```novo
+// use mydriver
+// use myconn
+//
+// fn main() [io, net, time]
+//     match mydriver.open(myconn.default_options("app"), myconn.plain_transport())
+//         Ok(db) => println("connected")
+//         Err(_) => println("could not connect")
+// ```
+pub fn open(o: MyConnectOptions, t: MyTransport) -> Result<MyDatabase, MyFault> [net, time]
+    todo("mysql-nv.mydriver.open")
+
+// Wrap a connection the caller already has — one borrowed from a pool,
+// for instance.
+//
+// Does NOT close it on `close`: a pooled connection is the pool's, and
+// a driver that closed one would empty the pool a request at a time.
+// `close` on a borrowed database resets the session instead, and the
+// caller still has to `mypool.release`.
+pub fn of_conn(c: MyConn) -> MyDatabase
+    todo("mysql-nv.mydriver.of_conn")
+
+// Take a connection from a pool and wrap it.
+pub struct MyBorrowed
+    pool: MyPool
+    db: MyDatabase
+
+// Borrow.
+pub fn borrow(p: MyPool, now_ms: Int) -> Result<MyBorrowed, MyFault> [net, time]
+    todo("mysql-nv.mydriver.borrow")
+
+// Give a borrowed database back to its pool.
+pub fn give_back(p: MyPool, db: MyDatabase, now_ms: Int) -> Result<MyPool, MyFault> [net, time]
+    todo("mysql-nv.mydriver.give_back")
+
+// The fault behind the last `DbError` this handle answered, or `None`.
+//
+// The prelude's `DbError` has five variants and a message; a `MyFault`
+// carries the error number, the SQLSTATE and the server's own text.  A
+// caller written against `dyn Database` gets the first; one that has
+// chosen this engine can ask for the second, which is the only place
+// "duplicate entry for key `users.email`" survives the contract.
+//
+// ```novo
+// use mydriver
+// use myconn
+//
+// fn main() [io, net, time]
+//     match mydriver.open(myconn.default_options("app"), myconn.plain_transport())
+//         Err(_) => println("no")
+//         Ok(db) =>
+//             match mydriver.last_fault(db)
+//                 Some(f) => println("something went wrong")
+//                 None    => println("nothing has yet")
+// ```
+pub fn last_fault(db: MyDatabase) -> ?MyFault
+    todo("mysql-nv.mydriver.last_fault")
+
+// The connection underneath, for the rows the contract cannot carry.
+//
+// `myquery.query` takes it.  Published rather than hidden because a
+// driver that made the rows unreachable would be one nobody could use
+// for a `SELECT`.
+pub fn conn_of(db: MyDatabase) -> MyConn
+    todo("mysql-nv.mydriver.conn_of")
+
+// Every row of a query, as the values this package decodes.
+//
+// The convenience over `myquery.query` for a caller holding a
+// `MyDatabase` rather than a connection.
+pub struct MyRows
+    db: MyDatabase
+    rows: [[MyValue]]
+
+// Query.
+pub fn query(db: MyDatabase, sql: Str, parameters: [MyValue]) -> Result<MyRows, MyFault> [net, time]
+    todo("mysql-nv.mydriver.query")
+
+// The `DbError` a fault maps to.
+//
+// By SQLSTATE where there is one and by error number otherwise, which
+// is the difference from postgres-nv's mapping and is forced by the
+// wire: MySQL sends the SQLSTATE only under `CLIENT_PROTOCOL_41`.
+//
+// Published because the mapping is a judgement and a caller may
+// disagree with it — an application that treats a deadlock as
+// retryable rather than as `DbOther`, say — and because a mapping
+// nobody can see is one nobody can check.
+//
+// ```novo
+// use mydriver
+// use myerror
+//
+// fn main() [io]
+//     match mydriver.to_db_error(myerror.protocol_fault("unexpected packet"))
+//         ConnectionError(m) => println("a connection problem")
+//         e                  => println("something else")
+// ```
+pub fn to_db_error(f: MyFault) -> DbError
+    todo("mysql-nv.mydriver.to_db_error")

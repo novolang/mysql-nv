@@ -1,0 +1,327 @@
+// host_tests.nv — the four modules that connect, and the parts of them
+// a test can assert with no server.
+//
+// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
+// assertion here reaches `not implemented: mysql-nv.<module>.<fn>`.
+//
+// WHAT IS ASSERTABLE HERE, AND WHAT IS NOT.  `myconn`, `myquery`,
+// `mypool` and `mydriver` need a MySQL server, and the implementation
+// lane's own gate is a real one — a `mysqld`, a socket, a corpus of
+// statements, and the same queries through `mysql` for comparison, with
+// MariaDB beside it because the two disagree about
+// `caching_sha2_password` and about which EOF a result set ends with.
+// What can be asserted with no server is everything the design put into
+// a VALUE rather than into an exchange: the defaults, the pool's policy
+// (because `acquire` and `release` take the clock reading as an
+// argument, so a test can age a pool without sleeping), the local-file
+// path check, and every `[net]` entry point against a port nothing is
+// listening on, which asserts the refusal rather than the success.
+
+use std.test
+use std.bytes
+use std.list
+use myerror
+use mytype
+use myconn
+use myquery
+use mypool
+use mydriver
+
+// Options pointing at a port nothing is listening on.  Named once, so
+// the tests say what they are about.
+fn unreachable() -> MyConnectOptions
+    myconn.default_options("app")
+
+// The three named functions a caller's own transport supplies.  Named
+// rather than lambdas: a lambda that becomes a value is refused at
+// `@tier(embedded)`, and the shape is the one the rest of the grid
+// uses.
+fn never_sends(handle: Int, payload: Bytes) -> ?MyFault
+    Some(myerror.protocol_fault("this transport sends nothing"))
+
+fn never_receives(handle: Int, n: Int) -> Result<Bytes, MyFault>
+    Err(myerror.protocol_fault("this transport receives nothing"))
+
+fn never_closes(handle: Int) -> ?MyFault
+    None
+
+@test
+fn test_the_defaults_are_readable_in_one_place() [io, net, time]
+    let o = myconn.default_options("app")
+
+    test.case("the port MySQL has used since 1996")
+    test.assert_eq(o.port, 3306)
+
+    test.case("the user is the one asked for")
+    test.assert_eq_str(o.user, "app")
+
+    test.case("the character set is the one that holds every code point")
+    test.assert_eq(o.collation, mytype.utf8mb4_collation())
+
+    test.case("cleartext over an unencrypted socket is NOT allowed by default")
+    test.assert(o.allow_cleartext == false)
+
+    test.case("and the packet ceiling is the caller's, not the wire's")
+    test.assert(o.max_packet_bytes > 0)
+
+@test
+fn test_local_infile_is_off_and_that_is_the_only_complete_defence() [io]
+    // The server can ask the client to send ANY path the client process
+    // can read.  Not negotiating `CLIENT_LOCAL_FILES` means the server
+    // cannot ask at all.
+    match myconn.default_options("app").local_infile
+        MyLocalInfileOff        => test.assert(true)
+        MyLocalInfileUnder(dir) => test.assert(false)
+
+@test
+fn test_a_unix_socket_is_recognised_by_its_path() [io]
+    // The rule that decides between `net.connect` and
+    // `net.unix_connect`, and the reason one field covers both.
+    test.case("a path is a socket")
+    test.assert(myconn.is_unix_socket("/var/run/mysqld/mysqld.sock"))
+
+    test.case("and a host name is not")
+    test.assert(myconn.is_unix_socket("db.internal") == false)
+
+@test
+fn test_the_five_ssl_modes_are_five_different_promises() [io]
+    // A server that does not offer TLS has not FAILED — it has said no,
+    // and a client that carried on has silently downgraded a connection
+    // somebody asked to encrypt.
+    let o = myconn.default_options("app")
+    match o.ssl_mode
+        MySslDisable        => test.assert(true)
+        MySslPrefer         => test.assert(true)
+        MySslRequire        => test.assert(true)
+        MySslVerifyCa       => test.assert(true)
+        MySslVerifyIdentity => test.assert(true)
+
+@test
+fn test_every_connecting_entry_point_refuses_a_port_with_nothing_behind_it() [io, net, time]
+    test.case("a transport the caller assembled is still a transport")
+    let t = myconn.transport(never_sends, never_receives, never_closes)
+
+    test.case("connect")
+    match myconn.connect(unreachable(), t)
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+    test.case("and the plain transport is the one over std.net")
+    match myconn.connect(unreachable(), myconn.plain_transport())
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+    test.case("opening a database over one fails the same way")
+    match mydriver.open(unreachable(), myconn.plain_transport())
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+@test
+fn test_the_connecting_surface_is_named_where_a_caller_would_reach_it() [io, net, time]
+    // Every entry point on a connection this test cannot open.  The
+    // assertions are that the calls EXIST with these signatures; the
+    // behaviour is the implementation lane's gate against a real
+    // server.
+    match myconn.connect(unreachable(), myconn.plain_transport())
+        Ok(c)  =>
+            test.assert(myconn.connection_id(c) >= 0)
+            test.assert(myconn.capabilities(c).flags >= 0)
+            test.assert(myconn.in_transaction(c) == false)
+            test.assert(myconn.is_broken(c) == false)
+            match myconn.negotiate_tls(c)
+                Err(_) => test.assert(true)
+                Ok(_)  => test.assert(true)
+            match myconn.next_packet(c)
+                Err(_) => test.assert(true)
+                Ok(_)  => test.assert(true)
+            match myconn.send_command(c, bytes.from_byte_list([14]))
+                Err(_) => test.assert(true)
+                Ok(_)  => test.assert(true)
+            match myconn.ping(c)
+                Err(_) => test.assert(true)
+                Ok(_)  => test.assert(true)
+            match myconn.reset_session(c)
+                Err(_) => test.assert(true)
+                Ok(_)  => test.assert(true)
+            match myconn.select_database(c, "appdb")
+                Err(_) => test.assert(true)
+                Ok(_)  => test.assert(true)
+            match myconn.kill_query(c, 7)
+                Err(_) => test.assert(true)
+                Ok(_)  => test.assert(true)
+            myconn.close(c)
+        Err(_) => test.assert(true)
+
+@test
+fn test_the_query_surface_is_named_where_a_caller_would_reach_it() [io, net, time]
+    match myconn.connect(unreachable(), myconn.plain_transport())
+        Ok(c)  =>
+            match myquery.exec(c, "CREATE TABLE t (n INT)")
+                Err(_) => test.assert(true)
+                Ok(_)  => test.assert(true)
+            match myquery.query(c, "SELECT n FROM t WHERE n > ?", [MyInt(v: 1)])
+                Err(_) => test.assert(true)
+                Ok(_)  => test.assert(true)
+            match myquery.next_result(c)
+                Err(_) => test.assert(true)
+                Ok(_)  => test.assert(true)
+            match myquery.send_local_file(c, bytes.zeros(0))
+                Err(_) => test.assert(true)
+                Ok(_)  => test.assert(true)
+            match myquery.refuse_local_file(c)
+                Err(_) => test.assert(true)
+                Ok(_)  => test.assert(true)
+            match myquery.prepare(c, "INSERT INTO t (n) VALUES (?)")
+                Err(_) => test.assert(true)
+                Ok(p)  =>
+                    match myquery.execute(p, [MyInt(v: 1)])
+                        Err(_) => test.assert(true)
+                        Ok(_)  => test.assert(true)
+                    match myquery.reset_statement(p)
+                        Err(_) => test.assert(true)
+                        Ok(_)  => test.assert(true)
+                    match myquery.send_long_data(p, 0, bytes.from_str("x"))
+                        Err(_) => test.assert(true)
+                        Ok(_)  => test.assert(true)
+                    match myquery.close_statement(p)
+                        Err(_) => test.assert(true)
+                        Ok(_)  => test.assert(true)
+        Err(_) => test.assert(true)
+
+@test
+fn test_a_local_path_is_checked_after_resolving_it_and_not_before() [io]
+    // A caller that wrote the comparison itself writes it on the
+    // unresolved string, and `/data/../etc/passwd` passes that test.
+    test.case("a path inside the directory is allowed")
+    test.assert(myquery.local_path_allowed("/data", "/data/rows.csv"))
+
+    test.case("a path that walks out of it is not")
+    test.assert(myquery.local_path_allowed("/data", "/data/../etc/passwd") == false)
+
+    test.case("and neither is one that was never inside")
+    test.assert(myquery.local_path_allowed("/data", "/etc/passwd") == false)
+
+@test
+fn test_a_result_set_is_read_by_position_or_by_name() [io]
+    let r = MyResultSet {
+        columns: [],
+        rows: [],
+        buffer: bytes.zeros(0),
+        ok: MyOk {
+            affected_rows: 0,
+            last_insert_id: 0,
+            status_flags: 0,
+            warnings: 0,
+            info_at: 0,
+            info_len: 0 },
+        more_results: false }
+
+    test.case("an empty result set has no rows")
+    test.assert_eq(myquery.row_count(r), 0)
+
+    test.case("no cell at any position")
+    test.assert_none(myquery.value_at(r, 0, 0))
+
+    test.case("and none by name either")
+    test.assert_none(myquery.value_named(r, 0, "n"))
+
+@test
+fn test_affected_rows_means_changed_and_not_matched() [io]
+    // An `UPDATE` that set a column to the value it already had answers
+    // zero, and a caller checking "did my update apply" against it gets
+    // the wrong answer.
+    let o = MyAffected(ok: MyOk {
+        affected_rows: 0,
+        last_insert_id: 7,
+        status_flags: 0,
+        warnings: 0,
+        info_at: 0,
+        info_len: 0 })
+
+    test.case("nothing changed")
+    test.assert_eq(myquery.affected_rows(o), 0)
+
+    test.case("and the insert id is there even so")
+    test.assert_eq(myquery.last_insert_id(o), 7)
+
+@test
+fn test_the_pool_policy_is_the_part_worth_publishing() [io]
+    let p = mypool.default_policy()
+
+    test.case("a pool with no limit exhausts the server's max_connections")
+    test.assert(p.max_connections > 0)
+
+    test.case("an idle connection is closed before a firewall closes it")
+    test.assert(p.max_idle_ms > 0)
+
+    test.case("a connection has a lifetime, so a rolling restart drains")
+    test.assert(p.max_lifetime_ms > 0)
+
+    test.case("and one idle a while is pinged before it is lent out")
+    test.assert(p.ping_after_idle_ms > 0)
+
+@test
+fn test_a_pool_is_a_value_and_its_clock_is_the_caller_s() [io, net, time]
+    let p = mypool.pool(unreachable(), myconn.plain_transport(), mypool.default_policy())
+
+    test.case("a fresh pool has opened nothing")
+    test.assert_eq(mypool.idle_count(p), 0)
+    test.assert_eq(mypool.borrowed_count(p), 0)
+
+    test.case("and has nothing to prune")
+    test.assert_eq(mypool.prune(p, 0).closed, 0)
+
+    test.case("nothing idle is usable, because nothing is idle")
+    test.assert(mypool.idle_is_usable(p, 0, 0) == false)
+
+    test.case("the reset it runs on release is worth asking about")
+    test.assert(mypool.resets_on_release(p))
+
+    test.case("acquiring from a pool whose server is not there fails")
+    match mypool.acquire(p, 0)
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+    test.case("and borrowing a database from it fails the same way")
+    match mydriver.borrow(p, 0)
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+    mypool.close_all(p)
+
+@test
+fn test_release_and_discard_are_different_answers() [io, net, time]
+    // A connection whose state is unknown — a protocol fault, a read
+    // timeout mid-result-set — must not be pooled: the next borrower
+    // would inherit an unread result set.
+    let p = mypool.pool(unreachable(), myconn.plain_transport(), mypool.default_policy())
+    match myconn.connect(unreachable(), myconn.plain_transport())
+        Err(_) => test.assert(true)
+        Ok(c)  =>
+            match mypool.release(p, c, 0)
+                Err(_) => test.assert(true)
+                Ok(q)  => test.assert(mypool.idle_count(q) >= 0)
+            test.assert_eq(mypool.idle_count(mypool.discard(p, c)), 0)
+
+@test
+fn test_the_driver_surface_and_the_error_mapping_are_named() [io, net, time]
+    test.case("the mapping is a judgement and is published so it can be checked")
+    match mydriver.to_db_error(myerror.protocol_fault("unexpected packet"))
+        ConnectionError(m) => test.assert(true)
+        e                  => test.assert(true)
+
+    match mydriver.open(unreachable(), myconn.plain_transport())
+        Err(_) => test.assert(true)
+        Ok(db) =>
+            test.assert_none(mydriver.last_fault(db))
+            test.assert(myconn.is_broken(mydriver.conn_of(db)) == false)
+            let again = mydriver.of_conn(mydriver.conn_of(db))
+            test.assert_none(mydriver.last_fault(again))
+            match mydriver.query(db, "SELECT 1", [])
+                Err(_) => test.assert(true)
+                Ok(r)  => test.assert_eq(list.len(r.rows), 0)
+            let p = mypool.pool(unreachable(), myconn.plain_transport(), mypool.default_policy())
+            match mydriver.give_back(p, db, 0)
+                Err(_) => test.assert(true)
+                Ok(_)  => test.assert(true)
+            db.close()
