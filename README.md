@@ -1,328 +1,444 @@
 # mysql-nv
 
-**Status: NOT IMPLEMENTED — interface only.**
+MySQL is a relational database server, and MariaDB is the fork of it
+that most Linux distributions ship. Both speak the MySQL
+client/server protocol, which is documented in full in the
+[Client/Server Protocol](https://dev.mysql.com/doc/dev/mysql-server/latest/PAGE_PROTOCOL.html)
+chapter of the MySQL server manual. This package speaks that protocol
+in novo-lang, with no `libmysqlclient` underneath it: the packet
+framing, the two authentication plugins, the text and binary query
+protocols, the column types, a connection pool and a `std.sql` driver.
 
-Every public function below is published with its signature and its
-effect row, and every body is `todo()`.  Installing this package works;
-calling it panics with `not implemented`.
+**Status: NOT IMPLEMENTED — interface only.** Every function is
+declared with its full signature, but every body is a `todo()` that
+panics when called. The package is published so its design can be
+reviewed and depended on before it is implemented. Version 0.1.0 will
+be the first working release.
 
-## What this is
+## What the protocol is
 
-A MySQL and MariaDB client, in novo-lang, with no libmysqlclient.
+A client opens a socket, the server sends a **handshake** naming its
+version, a 20-byte random **scramble** and the features it supports,
+and the client answers with a **handshake response** naming the user,
+the features it wants and a value derived from the password and the
+scramble. From then on both ends send **packets**.
 
-The protocol is documented, stable and thirty years old, and every
-language that talks to MySQL without C has ported it — Go, Rust, Java,
-Python.  This is that port: the packet framing, the two authentication
-plugins, the text and binary query protocols, the column types, `LOAD
-DATA LOCAL` as a value the caller answers, TLS as a hook, a pool and a
-`std.sql` driver.
+A packet is a 3-byte payload length, a 1-byte **sequence id**, and the
+payload. The sequence id resets to 0 at the start of each command and
+increments by one per packet, wrapping at 256. The server checks it
+and answers `Packets out of order` when it does not match.
 
-Eight modules, and a reader should know which one they are on.
+The features the two ends agreed are the **capabilities**, a 32-bit
+flag word. **The capabilities decide what the bytes mean.** With
+`CLIENT_DEPRECATE_EOF` the server sends an OK packet where it used to
+send an EOF packet. With `CLIENT_PROTOCOL_41` an error packet carries
+a five-character **SQLSTATE** and without it does not. With
+`CLIENT_FOUND_ROWS` the affected-row count means rows matched rather
+than rows changed. So every decode in this package takes the
+negotiated capabilities as an argument.
 
-| surface | module | reach for it when |
-| --- | --- | --- |
-| the **frame** | `mypacket` | anything. Start here |
-| the **login** | `myauth` | you are debugging a handshake |
-| the **values** | `mytype` | you are reading or binding a column |
-| the **faults** | `myerror` | something went wrong |
-| the **connection** | `myconn` | you want the socket, or TLS |
-| the **queries** | `myquery` | you want rows |
-| the **pool** | `mypool` | you have more than one request at a time |
-| the **contract** | `mydriver` | you want a `dyn Database` |
+A statement is sent in one of two protocols. The **text protocol** is
+`COM_QUERY`: the statement as a string, and every value in the answer
+as characters, so the integer 42 arrives as the two bytes `4` and `2`.
+It has no parameters at all. The **binary protocol** is a **prepared
+statement**: the text is sent once with `?` placeholders, the values
+are sent separately, and the answer arrives in each column's own
+layout with a **NULL bitmap** at the front. A parameterised query is
+therefore always a prepared one.
 
-113 public functions and seven trait members, every body a `todo()`.
+An exchange ends with an **OK packet** or an **error packet**. The OK
+packet carries the server's **status flags**, and the transaction's
+state is one of them. There is no separate end-of-exchange message.
 
-## Adding it, and checking it
+`LOAD DATA LOCAL INFILE` is a statement that makes the server ask the
+client for a file. Mid-exchange the server sends a packet beginning
+`0xFB` and carrying a path, and a client that honours it sends that
+file's contents. **The path is the server's choice.** This package
+never reads a file: the request arrives as a value, and the caller
+decides.
 
-```bash
-novo pkg add mysql-nv             # into your novo.toml
-novo pkg build                    # type- and effect-check the package
-novo test --isolate tests/packet_tests.nv
+The numbers every packet is measured against are these.
+
+| Quantity | Value |
+| --- | --- |
+| Packet header | 4 bytes: a 3-byte length and a 1-byte sequence id |
+| Largest payload in one packet | 16,777,215 bytes (`0xFFFFFF`) |
+| Sequence id | 0 to 255, wrapping |
+| Service port | 3306 |
+| Server scramble | 20 bytes |
+| SQLSTATE | 5 characters, and absent without `CLIENT_PROTOCOL_41` |
+| Largest EOF packet | 9 bytes |
+| `TIME` range | −838:59:59 to 838:59:59 |
+
+Three error numbers decide what a caller does next.
+
+| Number | SQLSTATE | Meaning | What to do |
+| --- | --- | --- | --- |
+| 1062 | 23000 | Duplicate key | Not retryable |
+| 1213 | 40001 | Deadlock, and the transaction was rolled back | Re-run the whole transaction |
+| 1205 | HY000 | Lock wait timeout | Not retryable |
+
+## Install
+
+```
+novo pkg add mysql-nv
 ```
 
-`novo test` is red today and that is the point of the release: every
-assertion fails with `not implemented: mysql-nv.<module>.<fn>`.  Four
-suites, 41 tests.  They turn green one at a time as bodies land.
-
-## The one example that will work
+## Example
 
 ```novo
 use myconn
+use myerror
 use myquery
 use mytype
 
-// Ask a parameterised question, in the binary protocol.
-fn count_after(id: Int) -> Int [net, time]
-    match myconn.connect(myconn.default_options("app"), myconn.plain_transport())
-        Err(f) => -1
-        Ok(c) =>
-            match myquery.query(c, "SELECT count(*) FROM t WHERE id > ?", [MyInt(v: id)])
-                Err(f) => -1
-                Ok(r)  => 1
+fn main() [io, net, time]
+    // Where to connect and as whom. `plain_transport` is the standard
+    // library's socket; a program that wants TLS supplies its own.
+    let opts = myconn.default_options("app")
+
+    match myconn.connect(opts, myconn.plain_transport())
+        Err(f) => println("could not connect")
+        Ok(c)  =>
+            // The value goes as a parameter and never into the string.
+            // MySQL's text protocol has no parameters, so this prepares
+            // the statement, executes it and closes it again.
+            match myquery.query(c, "SELECT name FROM users WHERE id > ?", [MyInt(v: 100)])
+                Err(f) => println("the statement failed")
+                Ok(r)  =>
+                    match r.outcome
+                        // Rows came back. Read one cell by column name.
+                        MyRows(rows) =>
+                            match myquery.value_named(rows, 0, "name")
+                                Some(v) => println(mytype.value_text(v))
+                                None    => println("no such row or column")
+                        // No rows: an INSERT, an UPDATE, a CREATE TABLE.
+                        MyAffected(ok) => println("${myquery.affected_rows(r.outcome)} rows changed")
+                        // The server is asking this client for a file.
+                        // Refusing is the default answer.
+                        MyLocalFileWanted(path) =>
+                            match myquery.refuse_local_file(r.conn)
+                                Ok(_)  => println("refused ${path}")
+                                Err(_) => println("refused, and the connection went with it")
 ```
 
-The value goes as a parameter, not into the string.  MySQL's text
-protocol has no parameters at all, so a parameterised query is a
-prepared one — and `query` does that round trip for a caller that does
-not want to hold a statement.
+Build and test with `novo pkg build` and `novo test`. Today `novo test`
+fails on purpose: every test reaches a
+`not implemented: mysql-nv.<module>.<fn>` panic. The tests are the
+specification the implementation will have to satisfy.
 
-## The load-bearing interface
+## What the package contains
 
-`MyCapabilities`, and the rule that **the same bytes are different
-messages under different flags.**
+| Module | Contents |
+| --- | --- |
+| `mypacket` | The frame, the sequence number, the capability flags, the length-encoded integer and string, and the OK packet with its status flags. |
+| `myauth` | The handshake, the two authentication plugins, the full-authentication decision, and the password encryption that goes with it. |
+| `mytype` | A column definition, the two row encodings, the NULL bitmap, and the value type that keeps a decimal a decimal. |
+| `myerror` | The server's error packet, its number and its SQLSTATE, and the predicates that say whether a caller may retry. |
+| `myconn` | The socket, the connect and the login, the TLS hook, the two safety policies, and the command round trip that keeps the sequence number right. |
+| `myquery` | Sending statements in both protocols, reading result sets, the prepared-statement lifetime, and the local-file request. |
+| `mypool` | A pool of connections as a value, its policy, and the session reset that makes a returned connection safe to lend again. |
+| `mydriver` | The `std.sql` `Database` implementation, so a program can hold a database without naming an engine. |
 
-```novo norun:pseudo
-pub fn kind_of(buf: Bytes, p: MyPacket, c: MyCapabilities) -> MyPacketKind []
-pub fn looks_like_eof(buf: Bytes, p: MyPacket, c: MyCapabilities) -> Bool []
-pub fn read_ok(buf: Bytes, p: MyPacket, c: MyCapabilities) -> Result<MyOk, MyPacketFault> []
-pub fn read_error(buf: Bytes, p: MyPacket, c: MyCapabilities) -> MyServerError []
-```
+The first four modules perform no input or output at all. Every
+function in them is arithmetic over bytes the caller already holds.
+The last four declare `[net]`, and `[time]` where a deadline is
+consulted. No module in this package declares `[fs]`.
 
-**This is the difference from postgres-nv, and it is the whole shape of
-the package.**  In PostgreSQL a message's type byte determines its shape
-for all time, so `pgmsg.decode_backend` takes bytes and nothing else.
-In MySQL the wire format is *negotiated*: with `CLIENT_DEPRECATE_EOF`
-the server sends an OK packet where it used to send an EOF, with
-`CLIENT_PROTOCOL_41` an error packet carries a SQLSTATE and without it
-does not, and `CLIENT_FOUND_ROWS` changes what `affected_rows` means.
+## How to choose an entry point
 
-So every decode here takes the negotiated capabilities, `myconn.MyConn`
-carries them, and `myconn.capabilities` publishes them for a caller
-reading packets itself.  A decoder that cached the wrong value produces
-plausible garbage rather than an error — which is why the parameter is
-required at every call rather than remembered in a global.
+**`myquery.exec` sends a statement with no parameters**, in the text
+protocol. It is the right call for DDL and for a statement whose text
+is entirely the program's own.
 
-Three more rules come with the frame, each a public function because
-each one is a silent bug elsewhere.
+**`myquery.query` sends a statement with parameters**, in one call. It
+prepares the statement, executes it in the binary protocol, reads the
+answer and closes the statement again. Anything carrying a value from
+outside the program goes through this.
 
-**One: the sequence number is the client's to keep.**  Every packet
-carries a one-byte counter that resets to 0 at each command and
-increments per packet.  The server checks it and answers `Packets out of
-order`, which is not a network problem and not a query problem.
-`MySeq` is a value the connection threads, `mypacket.command_seq` is the
-reset, and `myconn.send_command` is where it happens so no call site can
-forget.
+**`myquery.prepare` and `execute` keep the statement.** Use them when
+the same statement runs many times, which is where the round trip
+saved is worth holding server state for. `close_statement` gives it
+back, and `reset_statement` clears the long data sent into it.
 
-**Two: a 16 MB payload is split, and the last piece may be empty.**  The
-length field is three bytes, so a payload of exactly `0xFFFFFF` is
-continued — and one that is an exact multiple of it is followed by a
-packet of length ZERO.  A reader that took the length at face value
-truncates a large row; one that stopped at the first short packet hangs
-on the terminator.  `mypacket.is_continued`.
+**`mypool` is for a program serving more than one request at a time.**
+`acquire` takes a connection, `release` gives it back after resetting
+the session.
 
-**Three: `0xFE` is three different things.**  It begins an EOF packet,
-it prefixes an 8-byte length-encoded integer, and it is a legal first
-byte of row data.  Which one depends on the packet's LENGTH and on the
-capabilities.  `mypacket.looks_like_eof` carries the whole rule; a
-parser that branched on the byte alone misreads any row beginning with
-it.
+**`mydriver.MyDatabase` is for a program that must not name an
+engine.** It implements the standard library's `Database` trait, so
+the same code runs over this client, over postgres-nv and over
+sqlite-nv. The trait has no row surface, so a caller that wants rows
+calls `mydriver.query` and has chosen MySQL by then.
 
-## Where this differs from postgres-nv, and why
+**`mypacket`, `myauth`, `mytype` and `myerror` together are the whole
+protocol with no socket.** That is the path for a proxy, a capture
+reader and a test, and none of it performs anything.
 
-The two packages are deliberately the same shape — a `[]` codec half and
-a `[net]` client half in one `host` package, a transport hook for TLS, a
-pool that is a value, a `std.sql` driver — and they differ in six places
-because the protocols do.
+## The rules a user needs
 
-| | postgres-nv | mysql-nv |
-| --- | --- | --- |
-| **message shape** | fixed by the type byte | negotiated: every decode takes `MyCapabilities` |
-| **framing** | a 4-byte length, one message per frame | a 3-byte length and a sequence id, with a 16 MB split |
-| **end of exchange** | `ReadyForQuery`, carrying the transaction status | nothing: the status rides every OK packet's flags |
-| **parameters** | the extended query protocol, either format | only a prepared statement has parameters at all |
-| **cancellation** | an out-of-band `CancelRequest` on a fresh socket | `KILL QUERY <id>`, an ordinary statement on a second connection |
-| **the dangerous feature** | none in the client | `LOAD DATA LOCAL INFILE` — see below |
-
-The one that changes the API most is the third.  postgres-nv's
-load-bearing rule is "only `ReadyForQuery` ends an exchange", and there
-is no such message here: MySQL's transaction status is a bit in the
-status flags of whatever OK packet last arrived, so `mypacket.in_transaction`
-takes an `MyOk` and `myconn.in_transaction` reads the connection's last
-one.  A caller that wants the same guarantee has to look at the flags
-after every statement, which is what the pool does before it takes a
-connection back.
-
-The second-biggest is cancellation.  PostgreSQL's cancel is a designed
-out-of-band request; MySQL's is `KILL QUERY` sent from somewhere else,
-so a caller that wants to cancel must be able to open a second
-connection at the moment it is needed.  That is why `MyConn` carries the
-server's thread id from the handshake rather than looking it up —
-looking it up needs the connection that is busy.
-
-## `LOAD DATA LOCAL INFILE`, and why this package has no `[fs]`
-
-Mid-exchange, a MySQL server can send a `0xFB` packet carrying a path
-and expect the client to send that file's contents.  The path is the
-SERVER's choice.  A compromised server, a hostile one, or one reached
-through a man in the middle can therefore ask a client for any file the
-client process can read — `~/.ssh/id_rsa`, a credentials file, the
-application's own configuration — and a client that honours the request
-sends it.
-
-This package's answer is that **it never reads a file**:
-
-- the capability is not negotiated by default
-  (`MyLocalInfileOff`), so the server cannot ask at all;
-- a caller that genuinely bulk-loads sets
-  `MyLocalInfileUnder(directory)`, and `myquery.local_path_allowed`
-  checks the request AFTER resolving `..` and symbolic links, because a
-  comparison on the unresolved string lets `/data/../etc/passwd`
-  through;
-- the request itself arrives as a VALUE — `MyLocalFileWanted(path)` —
-  and the caller reads the bytes and passes them to
-  `myquery.send_local_file`, or refuses with
-  `myquery.refuse_local_file`.
-
-So the `[fs]` that the feature costs is spent in the caller's program,
-where a reader of its manifest can see it, and this package's rows stay
-`[net]` and `[time]`.
+1. **Every decode takes the negotiated capabilities.** The same bytes
+   are different messages under different flags. `myconn.MyConn`
+   carries them and `myconn.capabilities` publishes them for a caller
+   reading packets itself. A decoder given the wrong value produces
+   plausible output rather than an error.
+2. **The sequence number is the client's to keep.** `MySeq` is the
+   value, `mypacket.command_seq` is the reset at the start of a
+   command, and `mypacket.next_seq` advances it.
+   `myconn.send_command` does both, so a caller using it cannot
+   forget. `Packets out of order` is this rule broken, and it is
+   neither a network fault nor a query fault.
+3. **A payload of exactly 16,777,215 bytes is continued by another
+   packet**, and a payload that is an exact multiple of that number is
+   followed by a packet of length zero to say it ended.
+   `mypacket.is_continued` is the rule. A reader that takes the length
+   at face value truncates a large row; one that stops at the first
+   short packet waits forever for the terminator.
+4. **`0xFE` is three different things.** It begins an EOF packet, it
+   prefixes an 8-byte length-encoded integer, and it is a legal first
+   byte of row data. Which one it is depends on the packet's length
+   and on the capabilities. `mypacket.looks_like_eof` carries the
+   whole rule, and a parser that branches on the byte alone misreads
+   any row starting with it.
+5. **Bound the packet size before the first read.**
+   `MyConnectOptions.max_packet_bytes` is the ceiling, and
+   `mypacket.frame_length` takes it. Without one, a length field on
+   the wire is an allocation the wire asked for.
+6. **The row format is an argument to every row decode.** A text row
+   sends every value as characters; a binary row sends each value in
+   its column's own layout. `mytype.MyRowFormat` says which, and it is
+   never remembered from a previous decode.
+7. **Read the NULL bitmap before the values of a binary row.** A NULL
+   in a binary row is a bit in the bitmap and the value is absent from
+   the payload entirely, so a decoder that skipped the bitmap reads
+   every later column at the wrong offset. The bitmap in a result row
+   is offset by two bits, which `mytype.binary_null_at` applies.
+8. **A NULL is not an empty string.** In a text row NULL is the length
+   prefix `0xFB` and an empty string is a length of zero. `MyNull` is
+   a variant of `MyValue` and never an empty buffer.
+9. **A `DECIMAL` stays text.** The server sends it as characters, and
+   a driver that parses it into a `Float` has rounded somebody's
+   money. `MyDecimal` carries the digits.
+10. **Read the column flags, not only the type code.** `UNSIGNED_FLAG`
+    turns a `BIGINT` into a range no signed 64-bit integer holds, and
+    `MyUnsignedText` carries those digits. `BINARY_FLAG` turns a
+    `VARCHAR` into bytes rather than text.
+11. **`TIME` is a duration, not a clock reading.** It runs from
+    −838:59:59 to 838:59:59, and a driver that modelled it as a time
+    of day cannot hold half its range.
+12. **`0000-00-00` is a value MySQL stores.** No calendar has it, and
+    a driver that refused it could not read tables that exist. It is
+    its own variant, `MyZeroDate`.
+13. **Ask for `utf8mb4`, not `utf8`.** MySQL's `utf8` holds three
+    bytes per character and truncates at the first four-byte one.
+    `mytype.utf8mb4_collation` is the collation to connect with.
+14. **Check `SERVER_MORE_RESULTS_EXISTS` after every statement.** A
+    stored procedure answers several result sets in a row, and that
+    flag is the only thing that says so. A client that ignores it
+    leaves packets on the socket, and the next query reads the
+    previous statement's rows. `mypacket.more_results` reads the flag
+    and `myquery.next_result` reads the next set.
+15. **The transaction's state rides the OK packet's status flags.**
+    This protocol has no end-of-exchange message.
+    `mypacket.in_transaction` reads an OK packet and
+    `myconn.in_transaction` reads the connection's last one. A pool
+    checks it before taking a connection back.
+16. **`affected_rows` counts rows changed, not rows matched**, unless
+    `CLIENT_FOUND_ROWS` was negotiated. An update that set a column to
+    the value it already held counts zero.
+17. **A deadlock rolls the whole transaction back.**
+    `myerror.rolled_back` says so, and re-running from the failing
+    statement commits half a transaction. `myerror.is_retryable` is
+    the list of error numbers a retry is correct for.
+18. **Branch on both the error number and the SQLSTATE.** The number
+    is MySQL's own and precise; the SQLSTATE is the ANSI class, which
+    is portable and vague. A caller reading only the SQLSTATE cannot
+    tell a deadlock from a lock wait timeout. Both are on
+    `MyServerError`.
+19. **Cancelling a statement needs a second connection.** MySQL has no
+    out-of-band cancel: a caller sends `KILL QUERY <id>` from
+    somewhere else. `MyConn` carries the server's thread id from the
+    handshake for that reason, because looking it up would need the
+    connection that is busy. `myconn.kill_query` is the call.
+20. **A connection returned to the pool is reset.** MySQL keeps
+    temporary tables, user variables, prepared statements, the current
+    database, `SET` variables and the transaction across a release.
+    `mypool.release` runs `COM_RESET_CONNECTION`, which clears all of
+    it in one round trip. A server too old for that command gets a
+    `SET`-based fallback, and `mypool.resets_on_release` says which is
+    in use.
 
 ## Authentication
 
-`myauth` is `[]` — no socket, no clock, no randomness — and the server's
-nonce is the caller's argument, which is what makes the handshake
-testable against a captured exchange.
+`myauth` performs nothing: no socket, no clock and no randomness. The
+server's scramble comes in as an argument, so a whole handshake
+reproduces byte for byte from a captured exchange.
 
-**`caching_sha2_password` has a fast path and a slow path, and the slow
-path is where the password goes.**  The fast path is a scramble the
-server checks against its cache and is safe on a plain socket.  When the
-cache misses — a fresh server, a restarted one, a user's first
-connection — the server asks for full authentication, and the client
-must send the password where the server can read it: in the clear over
-TLS, or RSA-encrypted under the server's public key.  Two refusals,
-because in each case the plausible behaviour is the insecure one:
+**`caching_sha2_password` has a fast path and a slow path.** The fast
+path is a scramble the server checks against its cache, and it is safe
+on an unencrypted socket. When the cache misses, which happens on a
+fresh server, a restarted one and a user's first connection, the
+server asks for **full authentication**, and the client must send the
+password where the server can read it: in the clear over TLS, or
+encrypted under the server's RSA public key. `MyFullAuth` is that
+decision, and it is handed back to the caller rather than taken.
 
-- **sending the password in the clear over an unencrypted socket** —
-  refused unless `allow_cleartext`, because otherwise a cache miss
-  silently downgrades every connection that ever hits one;
-- **fetching the server's RSA public key over that same unencrypted
-  socket** — refused unless the caller pinned one, because a key an
-  attacker in the middle substituted encrypts the password to the
-  attacker.
+Two things are refused, because in each case the plausible behaviour
+is the unsafe one.
 
-`mysql_native_password` is SHA-1 and is implemented rather than refused,
-because refusing it means refusing to connect to MariaDB and to every
-MySQL 5.7.  It is weak — the stored verifier is password-equivalent, so
-anybody who can read the user table can log in as that user — and
-`myauth.is_weak_plugin` is the predicate a caller with a policy can
-refuse on.
-
-**An empty password sends a zero-length response**, under both plugins.
-A client that scrambled the empty string sends 20 bytes the server
-rejects with "access denied", which sends everybody looking at the
-password.
-
-## TLS is a hook, not a dependency
-
-A driver that chose a TLS implementation would choose it for every
-program that links the driver.  `myconn.MyTransport` is the seam: three
-named functions that move bytes, with `myconn.plain_transport` the
-`std.net` pair.  MySQL's STARTTLS is one short packet carrying the
-capability flags and nothing else, so `negotiate_tls` is a separate call
-with the caller's handshake between it and the login — and a client that
-put its username in that first packet has sent it in the clear.
-
-`MySslMode` has five values and no default, because **a server that does
-not offer TLS has not failed.**  It has said no, and a client that
-carried on has silently downgraded a connection the user asked to
-encrypt.  `MySslRequire` and above refuse.
-
-## The `std.sql` driver
-
-`mydriver.MyDatabase` implements the prelude's `Database` trait, so a
-program written against `dyn Database` runs over this client, over
-postgres-nv and over sqlite-nv with nothing in it naming any of them.
-
-**What the effect row costs, stated rather than discovered.**  The
-trait's members declare `[io]`; this impl declares `[net, time]`, which
-is legal — a trait with no effect parameter does not pin its impls'
-rows.  The bill is that **a `dyn Database` call is charged the UNION
-over every impl in the program** (SPEC § 5.6), so a program that links
-this package makes every `dyn Database` call in it cost `[net, time]`,
-including the ones that only ever hold a file.  Concrete receivers are
-charged their own rows, so the union is only paid where the engine
-really is unknown.
-
-This is the same obstruction postgres-nv's `pgdriver` records, and it
-has the same fix: an effect parameter on the trait.  It is a **contract
-change** and belongs in a feature file; this package names it rather
-than working around it, and it is the widening this lane found.
-
-## What the wire gets wrong quietly, and where each one has a name
-
-| the mistake | what it costs | where it is named |
+| Refused | Unless | Why |
 | --- | --- | --- |
-| one socket read treated as one packet | works on localhost, fails under load | `mypacket.frame_length` |
-| the length field trusted | an allocation the wire asked for | `frame_length`'s `max_bytes` |
-| the sequence number not tracked | `Packets out of order` on the second statement | `mypacket.next_seq` |
-| a 16 MB row read as one packet | a truncated value, or a hang | `mypacket.is_continued` |
-| `0xFE` branched on as a byte | a row beginning with it read as end-of-set | `mypacket.looks_like_eof` |
-| the NULL bitmap's two-bit offset | every prepared column shifted by one | `mytype.binary_null_at` |
-| `DECIMAL` converted to `Float` | money, rounded | `MyDecimal` |
-| a NULL read as an empty string | two different values collapsed | `MyNull` |
-| `TIME` modelled as a clock time | half its range unrepresentable | `MyTime` |
-| `0000-00-00` refused | tables that exist cannot be read | `MyZeroDate` |
-| `utf8` asked for instead of `utf8mb4` | truncated at the first emoji | `mytype.utf8mb4_collation` |
-| `SERVER_MORE_RESULTS_EXISTS` ignored | the next query reads the last one's rows | `mypacket.more_results` |
-| a connection returned mid-transaction | the next borrower inside somebody else's | `mypool.release` |
-| `affected_rows` read as "matched" | an update that changed nothing looks like a failure | `myquery.affected_rows` |
-| a deadlock retried from the failing statement | half a transaction committed | `myerror.rolled_back` |
+| Sending the password in the clear over an unencrypted socket | `allow_cleartext` is set | One cache miss would otherwise downgrade the connection silently |
+| Fetching the server's RSA public key over that same socket | a key is pinned in `pinned_public_key` | A key substituted in the middle encrypts the password to the attacker |
 
-## What is out of scope, out loud
+**`mysql_native_password` is SHA-1 and is implemented rather than
+refused**, because refusing it means refusing to connect to MariaDB
+and to every MySQL 5.7. It is weak: the stored verifier is
+password-equivalent, so anyone who can read the user table can log in
+as that user. `myauth.is_weak_plugin` is the predicate a caller with a
+policy refuses on.
 
-**Replication and binlog.**  `COM_BINLOG_DUMP` and the row-based event
-format are a package of their own, and a client that half-implemented
-them would be a client that silently skips events.
+**An empty password sends a zero-length response**, under both
+plugins. A client that scrambled the empty string sends 20 bytes the
+server rejects with "access denied", which sends everyone looking at
+the password.
 
-**The old `COM_CHANGE_USER` and `COM_PROCESS_INFO`.**  Administrative
-commands with no portable behaviour across MySQL and MariaDB.
+## TLS and the two safety policies
 
-**Server-side cursors.**  `COM_STMT_FETCH` and the cursor flag on
-`COM_STMT_EXECUTE`.  Worth having and not needed for the first
-implementation; the row that wants it is a report over a table larger
-than memory.
+**TLS is a hook, not a dependency.** A driver that chose a TLS library
+would choose it for every program that links the driver.
+`myconn.MyTransport` is the seam: three named functions that send,
+receive and close. `myconn.plain_transport` is the `std.net` pair.
+MySQL's own STARTTLS is a short packet carrying the capability flags
+and nothing else, so `myconn.negotiate_tls` is a separate call with
+the caller's TLS handshake between it and the login. A client that put
+its username in that first packet has sent it in the clear.
 
-**Compression.**  `CLIENT_COMPRESS` wraps every packet in a second
-framing layer with its own length and its own sequence number, and it is
-a measurable win only over a slow link.  It is a second decoder, and the
-first one should work first.
+`MySslMode` has five values and no default.
 
-**`async`.**  Every call blocks its task.  `std.net` has `recv_async`
-and this package does not use it yet; the row that wants it is a server
-handling many connections per cell, and the change is an effect row and
-a second set of entry points rather than a redesign.
+| Mode | What it does |
+| --- | --- |
+| `MySslDisable` | Never asks. The honest mode for a Unix socket |
+| `MySslPrefer` | Asks, and carries on in the clear if the server says no |
+| `MySslRequire` | Asks, and refuses the connection if the server says no |
+| `MySslVerifyCa` | As require, and the certificate must chain to a trusted root |
+| `MySslVerifyIdentity` | As verify-ca, and the certificate must name the host asked for |
 
-**A pool that synchronises.**  `mypool.MyPool` is a VALUE, so it does
-not synchronise anything and cannot: two tasks sharing one share it the
-way they share any other value in this language.  `cell.pool` is how
-novo-lang programs own shared state, and a pool per cell with no sharing
-is the shape that actually runs.
+A server that does not offer TLS has not failed. It has said no, and a
+client that carried on has downgraded a connection somebody asked to
+encrypt. Only `MySslVerifyIdentity` resists an active attacker.
 
-## The reference implementations
+**`LOAD DATA LOCAL INFILE` is off.** `MyLocalInfileOff` does not
+negotiate `CLIENT_LOCAL_FILES` at all, so the server cannot ask. A
+caller that genuinely bulk-loads sets `MyLocalInfileUnder(directory)`,
+and `myquery.local_path_allowed` checks the request after resolving
+`..` and symbolic links, because a comparison on the unresolved string
+lets `/data/../etc/passwd` through. Either way the request arrives as
+`MyLocalFileWanted(path)`, and the caller reads the bytes and calls
+`myquery.send_local_file`, or calls `myquery.refuse_local_file`. The
+`[fs]` that reading a file costs is spent in the caller's program.
 
-`go-sql-driver/mysql` and `mysql_async`, for the API shape; MySQL's own
-[Client/Server Protocol](https://dev.mysql.com/doc/dev/mysql-server/latest/PAGE_PROTOCOL.html)
-chapter for the wire, which is the normative document and what the
-module headers transcribe; MariaDB's own protocol documentation for the
-places the two forks disagree, which is mostly authentication and the
-EOF deprecation.
+## What is not included
 
-The implementation lane's gate is a real server — a `mysqld`, a socket,
-a corpus of statements, and the same queries through `mysql` for
-comparison — with **MariaDB beside it**, because a client tested against
-only one of the two forks passes and then fails to log in.
+- **Reading any file.** See the section above. No module here declares
+  `[fs]`.
+- **A TLS implementation.** `MyTransport` is where one goes.
+- **Replication and the binary log.** `COM_BINLOG_DUMP` and the
+  row-based event format are a package of their own, and a client that
+  half-implemented them would silently skip events.
+- **Server-side cursors.** `COM_STMT_FETCH` and the cursor flag on
+  `COM_STMT_EXECUTE`. A report over a table larger than memory is what
+  wants them.
+- **Protocol compression.** `CLIENT_COMPRESS` wraps every packet in a
+  second framing layer with its own length and sequence number. It is
+  a second decoder, and a measurable win only over a slow link.
+- **`COM_CHANGE_USER` and `COM_PROCESS_INFO`.** Administrative
+  commands whose behaviour differs between MySQL and MariaDB.
+- **Asynchronous calls.** Every call blocks its task. `std.net` has
+  `recv_async` and this package does not use it yet.
+- **A pool that synchronises.** `mypool.MyPool` is a value, so two
+  tasks sharing one share it the way they share any other value in
+  this language. A pool per cell with no sharing is the shape that
+  runs.
 
-## Status
+## Related packages
 
-Interface only.  Eight modules, 113 public functions and seven trait
-members, every body a `todo()`.
+- [postgres-nv](https://novo-lang.org/packages/postgres-nv) is the
+  same shape for PostgreSQL: a codec half that performs nothing, a
+  client half, a transport hook for TLS, a pool and a `std.sql`
+  driver. The protocols differ in five places worth knowing about.
 
-- `novo pkg build` — clean, 8 modules checked.
-- `novo test` — four suites, all red, every failure `not implemented`.
-- `scripts/shard_audit.sh --strict` — `effect-budget`, `dep-layer`,
-  `no-discharge-in-core`, `doc-examples` and `docs-pub` green; `test`
-  red by design.
+| | postgres-nv | mysql-nv |
+| --- | --- | --- |
+| Message shape | Fixed by the type byte | Negotiated: every decode takes the capabilities |
+| Framing | A 4-byte length, one message per frame | A 3-byte length and a sequence id, split at 16 MB |
+| End of exchange | A `ReadyForQuery` message | Nothing: the status rides every OK packet's flags |
+| Parameters | The extended query protocol, either format | Only a prepared statement has parameters |
+| Cancelling | An out-of-band request on a fresh socket | `KILL QUERY` on a second connection |
+
+- [sqlite-nv](https://novo-lang.org/packages/sqlite-nv) reads and
+  writes an SQLite database file directly. No server and no socket.
+- [migrate](https://novo-lang.org/packages/migrate) plans schema
+  migrations and produces their SQL. It runs nothing, so a caller
+  hands its steps to this package.
+- [query-builder-nv](https://novo-lang.org/packages/query-builder-nv)
+  builds statements as values and renders them for MySQL's dialect,
+  including its backtick quoting and its `ON DUPLICATE KEY UPDATE`.
+- [crypto-nv](https://novo-lang.org/packages/crypto-nv) is the SHA-1
+  and SHA-256 both authentication plugins are built on.
+- [calendar-nv](https://novo-lang.org/packages/calendar-nv) is the
+  civil date and time `mytype.to_civil` converts a `DATETIME` into.
+- `std.sql` in the standard library opens an SQLite file by shelling
+  out to the `sqlite3` binary. It is the `Database` contract this
+  package implements, not a MySQL client.
+
+## Tests
+
+```bash
+novo test tests/packet_tests.nv   # 10 tests: the frame, the sequence, the split
+novo test tests/auth_tests.nv     #  7 tests: both plugins, against captured scrambles
+novo test tests/type_tests.nv     # 10 tests: the two row formats and the values
+novo test tests/host_tests.nv     # 14 tests: the connection, the queries and the pool
+```
+
+The wire is MySQL's own Client/Server Protocol chapter, which is the
+normative document. MariaDB's protocol documentation is the reference
+where the two forks disagree, which is mostly authentication and the
+EOF deprecation. `go-sql-driver/mysql` and `mysql_async` are the
+reference implementations for the shape of the API.
+
+No test opens a socket. The scramble, the password and the server's
+bytes are all arguments, so a handshake is a value the test writes out
+and the same bytes produce the same response on every run. The suite
+checks that a packet of exactly `0xFFFFFF` bytes is read as continued,
+that a zero-length packet terminates the run that precedes it, that
+`0xFE` at the front of a long packet is row data and not an EOF, that
+an empty password sends nothing, that a binary row's NULL bitmap is
+read before its values, that a `DECIMAL` stays text, and that a
+connection is reset before it goes back into the pool.
+
+The tests compile today and fail at run, each on the
+`not implemented: mysql-nv.<module>.<fn>` panic that is its body. That
+is the expected state of an interface release. They turn green one at
+a time as bodies land.
+
+## Implementation status
+
+Nothing is implemented. Every function below is a `todo()`.
+
+| Module | Public surface |
+| --- | --- |
+| `mypacket` | The capability constructors and readers, `negotiate`, the five capability flag accessors, `frame_length`, `read_packet`, `is_continued`, `max_payload_bytes`, `kind_of`, `looks_like_eof`, `read_ok`, `in_transaction`, `more_results`, the length-encoded readers and writer, `write_packet`, `command_seq`, `next_seq` |
+| `myauth` | `read_handshake`, `plugin_of_name`, `plugin_name`, `is_weak_plugin`, `native_response`, `caching_sha2_response`, `read_auth_more_data`, `request_public_key`, `encrypt_password`, `cleartext_password`, `response`, `write_response`, `write_ssl_request` |
+| `mytype` | `read_column`, `column_name`, `read_row`, `binary_null_at`, `null_bitmap_bytes`, `is_unsigned`, `is_binary`, `type_name`, `encode_parameter`, `value_text`, `is_null`, `utf8mb4_collation`, `to_civil`, `of_civil` |
+| `myerror` | `read_error`, `is_retryable`, `rolled_back`, `is_constraint_violation`, `is_connection_error`, the three error-number constants, `protocol_fault`, `server_error` |
+| `myconn` | `plain_transport`, `transport`, `default_options`, `is_unix_socket`, `connect`, `negotiate_tls`, `next_packet`, `send_command`, `ping`, `reset_session`, `select_database`, `close`, `kill_query`, `connection_id`, `capabilities`, `in_transaction`, `is_broken` |
+| `myquery` | `exec`, `query`, `prepare`, `execute`, `close_statement`, `reset_statement`, `send_long_data`, `next_result`, `send_local_file`, `refuse_local_file`, `local_path_allowed`, `row_count`, `value_at`, `value_named`, `last_insert_id`, `affected_rows` |
+| `mypool` | `default_policy`, `pool`, `acquire`, `release`, `discard`, `prune`, `close_all`, `idle_count`, `borrowed_count`, `idle_is_usable`, `resets_on_release` |
+| `mydriver` | `open`, `of_conn`, `borrow`, `give_back`, `last_fault`, `conn_of`, `query`, `to_db_error`, and the `Database` members `close`, `exec` and `query_count` |
 
 ## Licence
 
-Apache-2.0.
+Apache-2.0. See `LICENSE`.
+
+<!-- docs/writing-a-readme.md is the style guide for this page. -->

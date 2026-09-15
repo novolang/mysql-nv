@@ -1,7 +1,7 @@
 [package]
 name        = "mysql-nv"
 license     = "Apache-2.0"
-version     = "0.0.1"
+version     = "0.0.2"
 description = "A MySQL and MariaDB client with no libmysqlclient: the packet framing and its sequence ids, caching_sha2_password and mysql_native_password over crypto-nv, the text and binary protocols, the column types, LOAD DATA LOCAL as a value the caller answers, TLS as a hook, a connection pool and a std.sql driver.  Interface only — every body is a todo()."
 
 # `license` sits immediately after the name, before any value that could
