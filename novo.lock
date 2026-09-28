@@ -3,9 +3,9 @@
 [calendar-nv]
 source = "registry"
 url = "https://registry.novo-lang.org"
-req = "^0.0.2"
-version = "0.0.2"
-hash = "96409f46f3946d4b40437754edc7e8a6f044521cfe286f5723ff10205a581f48"
+req = "^0.2.0"
+version = "0.2.0"
+hash = "027078a3906cbb69ad3cad0130b301a60bc5e855ec1ebc3dc0d6f4e7f2932d8c"
 
 [crypto-nv]
 source = "registry"
